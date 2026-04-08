@@ -37,12 +37,25 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 DATASET_VIDEOS_DIR     = "dataset_videos"
 DATASET_FRAMES_DIR     = "dataset_frames"
-FRAME_INTERVAL_SECONDS = 1     # one frame every N seconds
+FRAME_INTERVAL_SECONDS = 0.5     # one frame every N seconds
 SD_HEIGHT              = 480   # downscale target height (480p)
 JPEG_QUALITY           = 90    # JPEG quality 0-100
 
 VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv", ".webm"}
+
+# HUD regions to black out (1920x1080 coordinates) — keeps CNN focused on map visuals
+BLACKOUT_BOXES = [
+    (25,   600,  900, 1060),   # slot / ability area
+    (1450, 1875, 900, 1065),   # label / LSHIFT text area
+    (750,  1175, 970, 1050),   # fill sub-box
+]
 # ---------------------------------------------------------------------------
+
+
+def apply_blackout(frame):
+    for x0, x1, y0, y1 in BLACKOUT_BOXES:
+        frame[y0:y1, x0:x1] = 0
+    return frame
 
 
 def downscale_to_sd(frame, target_height: int = SD_HEIGHT):
@@ -108,6 +121,7 @@ def extract_frames(video_path: Path, output_dir: Path, interval_seconds: float, 
             break
 
         if frame_idx % frame_interval == 0:
+            apply_blackout(frame)
             out_path = output_dir / f"frame_{start_idx + saved_count:05d}.jpg"
             cv2.imwrite(str(out_path), frame, encode_params)
             saved_count += 1
