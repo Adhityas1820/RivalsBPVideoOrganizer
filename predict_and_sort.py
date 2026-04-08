@@ -17,6 +17,7 @@ import cv2
 from PIL import Image
 from torchvision import models, transforms
 from pathlib import Path
+from game_mode_select import is_domination
 
 # ---------------------------------------------------------------------------
 # Config
@@ -31,6 +32,22 @@ IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD  = [0.229, 0.224, 0.225]
 
 VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv", ".webm"}
+
+# Maps that belong to Domination mode — CNN is restricted to these when domination is detected
+DOMINATION_MAPS = {"Birnin TChalla", "Celestial Husk", "Hells Heaven", "Krakoa", "Royal Palace"}
+
+# Must match the blackout applied during training (1920x1080 coordinates)
+BLACKOUT_BOXES = [
+    (25,   600,  900, 1060),
+    (1450, 1875, 900, 1065),
+    (750,  1175, 970, 1050),
+]
+
+
+def apply_blackout(frame):
+    for x0, x1, y0, y1 in BLACKOUT_BOXES:
+        frame[y0:y1, x0:x1] = 0
+    return frame
 # ---------------------------------------------------------------------------
 
 _transform = transforms.Compose([
@@ -51,8 +68,10 @@ def load_map_classifier(model_path: str, device):
     return model, classes
 
 
-def classify_video(pil_frames: list, classifier, classes: list, device) -> tuple:
-    """Averages softmax probabilities across sampled frames. Returns (class_name, confidence)."""
+def classify_video(pil_frames: list, classifier, classes: list, device,
+                   allowed: set = None) -> tuple:
+    """Averages softmax probabilities across sampled frames. Returns (class_name, confidence).
+    If allowed is given, only classes in that set are considered."""
     all_probs = []
     for pil in pil_frames:
         tensor = _transform(pil).unsqueeze(0).to(device)
@@ -60,7 +79,12 @@ def classify_video(pil_frames: list, classifier, classes: list, device) -> tuple
             probs = F.softmax(classifier(tensor), dim=1).cpu().numpy()[0]
         all_probs.append(probs)
 
-    avg      = np.mean(all_probs, axis=0)
+    avg = np.mean(all_probs, axis=0)
+
+    if allowed:
+        mask = np.array([c in allowed for c in classes], dtype=float)
+        avg  = avg * mask
+
     best_idx = int(np.argmax(avg))
     return classes[best_idx], float(avg[best_idx])
 
@@ -90,6 +114,7 @@ def extract_pil_frames(video_path: Path, interval_seconds: float) -> list:
         ret, frame = cap.read()
         if not ret:
             break
+        apply_blackout(frame)
         frames.append(Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)))
         frame_idx += frame_interval
 
@@ -129,13 +154,20 @@ def main():
     for video_path in videos:
         print(f"\n[{video_path.name}]")
 
+        dom, dom_conf = is_domination(video_path)
+        if dom:
+            allowed = DOMINATION_MAPS
+        else:
+            allowed = {c for c in classes if c not in DOMINATION_MAPS}
+        print(f"  Mode   : {'Domination' if dom else 'Not Domination'}  ({dom_conf*100:.0f}% confidence)")
+
         pil_frames = extract_pil_frames(video_path, FRAME_INTERVAL_SECONDS)
         if not pil_frames:
             print("  Could not read video — skipping.")
             continue
         print(f"  Frames : {len(pil_frames)}")
 
-        map_name, conf = classify_video(pil_frames, classifier, classes, device)
+        map_name, conf = classify_video(pil_frames, classifier, classes, device, allowed=allowed)
         print(f"  Map    : {map_name}  ({conf*100:.1f}%)")
 
         dest_dir  = Path(SORTED_DIR) / map_name
