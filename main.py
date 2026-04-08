@@ -24,6 +24,7 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 from torchvision import models, transforms
+from game_mode_select import is_domination
 
 # ---------------------------------------------------------------------------
 # Config — paths
@@ -80,6 +81,14 @@ COMBO_NAMES         = {2: "Double", 3: "Triple", 4: "Quad", 5: "Penta"}
 FRAME_INTERVAL_SECONDS = 2
 IMG_SIZE = 224
 
+DOMINATION_MAPS = {"Birnin TChalla", "Celestial Husk", "Hells Heaven", "Krakoa", "Royal Palace"}
+
+BLACKOUT_BOXES = [
+    (25,   600,  900, 1060),
+    (1450, 1875, 900, 1065),
+    (750,  1175, 970, 1050),
+]
+
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD  = [0.229, 0.224, 0.225]
 
@@ -92,6 +101,12 @@ _transform = transforms.Compose([
 # ---------------------------------------------------------------------------
 # Shared helpers
 # ---------------------------------------------------------------------------
+
+def apply_blackout(frame):
+    for x0, x1, y0, y1 in BLACKOUT_BOXES:
+        frame[y0:y1, x0:x1] = 0
+    return frame
+
 
 def open_video(video_path: Path):
     cap = cv2.VideoCapture(str(video_path))
@@ -364,6 +379,7 @@ def extract_pil_frames(video_path: Path) -> list:
         ret, frame = cap.read()
         if not ret:
             break
+        apply_blackout(frame)
         frames.append(Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)))
         frame_idx += frame_interval
 
@@ -373,14 +389,18 @@ def extract_pil_frames(video_path: Path) -> list:
     return frames
 
 
-def classify_video(pil_frames: list, classifier, classes: list, device) -> tuple:
+def classify_video(pil_frames: list, classifier, classes: list, device,
+                   allowed: set = None) -> tuple:
     all_probs = []
     for pil in pil_frames:
         tensor = _transform(pil).unsqueeze(0).to(device)
         with torch.no_grad():
             probs = F.softmax(classifier(tensor), dim=1).cpu().numpy()[0]
         all_probs.append(probs)
-    avg      = np.mean(all_probs, axis=0)
+    avg = np.mean(all_probs, axis=0)
+    if allowed:
+        mask = np.array([c in allowed for c in classes], dtype=float)
+        avg  = avg * mask
     best_idx = int(np.argmax(avg))
     return classes[best_idx], float(avg[best_idx])
 
@@ -445,7 +465,13 @@ def main():
             print(f"[SKIP] {name} — could not read video.")
             continue
 
-        map_name, conf = classify_video(pil_frames, classifier, classes, device)
+        dom, dom_conf = is_domination(video_path)
+        if dom:
+            allowed = DOMINATION_MAPS
+        else:
+            allowed = {c for c in classes if c not in DOMINATION_MAPS}
+
+        map_name, conf = classify_video(pil_frames, classifier, classes, device, allowed=allowed)
         kills          = kills_by_name.get(name, 0)
         dashes, combos = dashes_by_name.get(name, (0, []))
 
