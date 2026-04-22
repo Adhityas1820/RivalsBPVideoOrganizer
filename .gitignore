@@ -11,9 +11,6 @@ dash_counts/
 debug_crops/
 test/
 
-# Models
-models/
-
 # Reference pictures (contour .npy files are small, keep them)
 reference pictures/*.jpg
 reference pictures/*.png

@@ -19,10 +19,10 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-#VIDEO_IN  = "unsorted_videos\\hall of djalia.mp4"
-VIDEO_IN  = "unsorted_videos\\arakko 3.mp4"
+VIDEO_IN  = r"unsorted_videos\symbiotic surface 1k.mp4"
+#VIDEO_IN  = "unsorted_videos\\arakko 3.mp4"
 
-VIDEO_OUT = "test/dash_annotated2.mp4"
+VIDEO_OUT = "test/dash_annotated2mk3.mp4"
 
 PROCESS_FPS = 60
 
@@ -31,43 +31,42 @@ SLOT2_SEARCH = (1575, 1625, 965, 1000)   # usual dash position
 SLOT3_SEARCH = (1500, 1550, 965, 1000)   # dash when Jump occupies slot 2
 SLOT2_LABEL  = (1575, 1625, 1030, 1050)
 SLOT3_LABEL  = (1500, 1550, 1030, 1050)
-SLOT_DETECT_FRAMES = 30                  # early frames sampled to pick the slot
+SLOT_DETECT_FRAMES = 240                  # early frames sampled to pick the slot
 
-RIGHT_SAMPLE_SEC = 7.95   # timestamp to sample right slot (slot2) contour
-LEFT_SAMPLE_SEC  = 12.04  # timestamp to sample left slot (slot3) contour
 
 WHITE_THRESH       = 200
-WHITE_RATIO_THRESH = 1.0
+WHITE_RATIO_THRESH = .95
+LABEL_GREY_THRESH  = 110   # catches grey label text (~rgb 134,138,144) as well as white
 
 STABLE_FRAMES      = 1
-OFF_FRAMES         = 5
+OFF_FRAMES         = 3
 DASH_REARM_SECS    = 0.3
 DASH_FLASH_SECS    = 1.0
-ZOOM_LOW_THRESH    = 0.2
+ZOOM_LOW_THRESH    = 0.5
+
+COMBO_WINDOW_PER_DASH = 0.3   # window = n * 450ms from first dash (900ms=Double, 1350=Triple, 1800=Quad, 2250=Penta)
+COMBO_NAMES           = {2: "Double", 3: "Triple", 4: "Quad", 5: "Penta"}
 
 ZOOM = 10
 
 # Separate contour files for each slot position
-RIGHT_CONTOUR_PATH = "reference pictures/slot_x_contour_right.npy"
-LEFT_CONTOUR_PATH  = "reference pictures/slot_x_contour_left.npy"
+RIGHT_CONTOUR_PATH       = "models/slot_x_contour_right.npy"
+LEFT_CONTOUR_PATH        = "models/slot_x_contour_left.npy"
+LABEL_RIGHT_CONTOUR_PATH = "models/label_slot2_contour.npy"
+LABEL_LEFT_CONTOUR_PATH  = "models/label_slot3_contour.npy"
 
-# Combo detection — label is "grey" when white pixel ratio drops below threshold
-LABEL_WHITE_THRESH  = 0.1   # label white ratio below this → ability on cooldown
-LABEL_STABLE_FRAMES = 10    # consecutive frames label must hold state before it flips
-COMBO_GAP_SECS     = 0.9    # max gap between consecutive dashes in the same combo
-COMBO_NAMES        = {2: "Double", 3: "Triple", 4: "Quad", 5: "Penta"}
 # ---------------------------------------------------------------------------
 
 
-def label_white_ratio(frame, x0, x1, y0, y1):
+def count_label_contours(frame, x0, x1, y0, y1) -> int:
     h, w = frame.shape[:2]
     crop = frame[min(y0,h):min(y1,h), min(x0,w):min(x1,w)]
     if crop.size == 0:
-        return 0.0
+        return 0
     gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-    return (gray > WHITE_THRESH).sum() / max(gray.size, 1)
-
-
+    _, mask = cv2.threshold(gray, LABEL_GREY_THRESH, 255, cv2.THRESH_BINARY)
+    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    return len(cnts)
 
 
 def white_ratio_in_contours(frame, contours, x0, y0, x1, y1):
@@ -130,46 +129,38 @@ def main():
     fh           = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     frame_interval = max(1, int(src_fps / PROCESS_FPS))
     flash_frames   = int(DASH_FLASH_SECS * src_fps)
-    sample_frame   = int(RIGHT_SAMPLE_SEC * src_fps)
 
-    # --- Detect which slot has the LSHIFT label ---
-    ratio2_acc = ratio3_acc = 0.0
+
+    # --- Detect which slot has LSHIFT: count contours in left label box ---
+    # 1 contour in left label = left slot active; more than 1 = right slot active
+    left_cnts_acc = 0
     sampled = 0
     while sampled < SLOT_DETECT_FRAMES:
         ret, frame = cap.read()
         if not ret:
             break
-        ratio2_acc += label_white_ratio(frame, *SLOT2_LABEL)
-        ratio3_acc += label_white_ratio(frame, *SLOT3_LABEL)
+        left_cnts_acc += count_label_contours(frame, *SLOT3_LABEL)
         sampled += 1
     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-    search_region = SLOT2_SEARCH if ratio2_acc >= ratio3_acc else SLOT3_SEARCH
-    slot_name     = "slot2" if ratio2_acc >= ratio3_acc else "slot3"
-    print(f"Dash slot : {slot_name}  (slot2: {ratio2_acc/max(sampled,1):.3f}, slot3: {ratio3_acc/max(sampled,1):.3f})")
+    avg_cnts      = left_cnts_acc / max(sampled, 1)
+    is_right      = avg_cnts > 1
+    search_region = SLOT2_SEARCH if is_right else SLOT3_SEARCH
+    slot_name     = "slot2" if is_right else "slot3"
+    print(f"Dash slot : {slot_name}  (left label avg contours: {avg_cnts:.2f})")
 
-    # --- Load or detect contours for BOTH slots ---
-    def load_or_detect(path_str, sample_sec, region):
+    # --- Load slot X contours from .npy files ---
+    def load_slot_contours(path_str):
         p = Path(path_str)
-        if p.exists():
-            data = np.load(str(p), allow_pickle=True)
-            contours = list(data)
-            print(f"Loaded contour from {p}  ({len(contours)} contour(s))")
-        else:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, int(sample_sec * src_fps))
-            ret, s = cap.read()
-            contours = []
-            if ret:
-                rx0, rx1, ry0, ry1 = region
-                contours, _ = find_all_contours(s, rx0, ry0, rx1, ry1)
-            if contours:
-                np.save(str(p), np.array(contours, dtype=object))
-                print(f"Detected and saved contour to {p}  ({len(contours)} contour(s))")
-            else:
-                print(f"[WARN] No white contours found for {p.name}")
+        if not p.exists():
+            print(f"[WARN] Contour file not found: {p}  — run assist_test_dash_mk2p1.py first")
+            return []
+        data = np.load(str(p), allow_pickle=True)
+        contours = list(data)
+        print(f"Loaded contour from {p}  ({len(contours)} contour(s))")
         return contours
 
-    right_contours = load_or_detect(RIGHT_CONTOUR_PATH, RIGHT_SAMPLE_SEC, SLOT2_SEARCH)
-    left_contours  = load_or_detect(LEFT_CONTOUR_PATH,  LEFT_SAMPLE_SEC,  SLOT3_SEARCH)
+    right_contours = load_slot_contours(RIGHT_CONTOUR_PATH)
+    left_contours  = load_slot_contours(LEFT_CONTOUR_PATH)
     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
 
     is_right      = (slot_name == "slot2")
@@ -212,18 +203,10 @@ def main():
     white_state      = False
     rearm_at         = 0
     read_idx         = 0
-
-    # Combo state
-    active_label_region    = SLOT2_LABEL if is_right else SLOT3_LABEL
-    label_ratio            = 0.0
-    label_is_grey          = False   # raw per-frame
-    label_candidate_grey   = False
-    label_candidate_streak = 0
-    label_stable_grey      = False   # debounced, used for combo logic
-    prev_label_stable_grey = False
-    combo_count            = 0
-    last_combo_dash_sec    = None
-    combos                 = []   # list of (count, name)
+    left_label_cnts  = 0
+    combo_count      = 0
+    combo_start_sec  = None
+    combos           = []
 
     while True:
         ret, frame = cap.read()
@@ -233,28 +216,7 @@ def main():
         if read_idx % frame_interval == 0:
             h_f, w_f = frame.shape[:2]
             white_state, cur_ratio = white_ratio_in_contours(frame, slot_contours, sx0, sy0, sx1, sy1)
-
-            # Track label grey/white state for combo detection
-            label_ratio   = label_white_ratio(frame, *active_label_region)
-            label_is_grey = label_ratio < LABEL_WHITE_THRESH
-
-            # Stable label state (debounced)
-            if label_is_grey == label_candidate_grey:
-                label_candidate_streak += 1
-            else:
-                label_candidate_grey   = label_is_grey
-                label_candidate_streak = 1
-            prev_label_stable_grey = label_stable_grey
-            if label_candidate_streak >= LABEL_STABLE_FRAMES:
-                label_stable_grey = label_candidate_grey
-
-            # Label just went white → finalize any open combo
-            if prev_label_stable_grey and not label_stable_grey:
-                if combo_count >= 2:
-                    name = COMBO_NAMES.get(combo_count, f"{combo_count}x")
-                    combos.append((combo_count, name))
-                combo_count         = 0
-                last_combo_dash_sec = None
+            left_label_cnts = count_label_contours(frame, *SLOT3_LABEL)
 
             # Zoom ratio — white ratio of the bounding box EXCLUDING slot x contour pixels
             h_f2, w_f2 = frame.shape[:2]
@@ -289,17 +251,18 @@ def main():
                 rearm_at   = read_idx + rearm_frames
                 was_off    = False
 
-                # Accumulate into combo while label is grey
-                if label_stable_grey:
-                    if last_combo_dash_sec is None or (t_sec - last_combo_dash_sec) <= COMBO_GAP_SECS:
-                        combo_count += 1
+                if combo_start_sec is None:
+                    combo_start_sec = t_sec
+                    combo_count     = 1
+                else:
+                    new_count = combo_count + 1
+                    if (t_sec - combo_start_sec) <= new_count * COMBO_WINDOW_PER_DASH:
+                        combo_count = new_count
                     else:
-                        # Gap too large — finalize previous combo, start new one
                         if combo_count >= 2:
-                            name = COMBO_NAMES.get(combo_count, f"{combo_count}x")
-                            combos.append((combo_count, name))
-                        combo_count = 1
-                    last_combo_dash_sec = t_sec
+                            combos.append((combo_count, COMBO_NAMES.get(combo_count, f"{combo_count}x")))
+                        combo_start_sec = t_sec
+                        combo_count     = 1
 
             if not white_state:
                 off_streak += 1
@@ -348,21 +311,6 @@ def main():
                 cv2.putText(frame, "slot x (zoomed)", (px, py - 5),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1, cv2.LINE_AA)
 
-            # Zoomed preview — label (right under slot x)
-            lx0, lx1, ly0, ly1 = active_label_region
-            label_preview = frame[min(ly0,fh):min(ly1,fh), min(lx0,fw):min(lx1,fw)]
-            if label_preview.size > 0:
-                lzh = max(label_preview.shape[0] * ZOOM, 1)
-                lzw = max(label_preview.shape[1] * ZOOM, 1)
-                lzoomed = cv2.resize(label_preview, (lzw, lzh), interpolation=cv2.INTER_NEAREST)
-                lpx, lpy = fw - lzw - 20, py + zh + 20
-                label_color = (100, 100, 100) if label_stable_grey else (200, 200, 200)
-                if lpy + lzh <= fh and lpx >= 0:
-                    frame[lpy:lpy+lzh, lpx:lpx+lzw] = lzoomed
-                    cv2.rectangle(frame, (lpx, lpy), (lpx+lzw, lpy+lzh), label_color, 2)
-                    cv2.putText(frame, f"label ({label_ratio:.3f})", (lpx, lpy - 5),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.45, label_color, 1, cv2.LINE_AA)
-
         # HUD text
         t_now = read_idx / src_fps
         hud_line = (
@@ -371,8 +319,8 @@ def main():
             f"  {'rearm' if read_idx < rearm_at else 'ready'}"
             f"  was_off: {'Y' if was_off else 'N'}"
             f"  dashes: {total_dashes}"
-            f"  lbl: {label_ratio:.3f} {'GREY' if label_stable_grey else ('grey?' if label_is_grey else 'white')}"
             f"  combo: {combo_count}"
+            f"  L3cnts: {left_label_cnts}"
         )
         cv2.putText(frame, hud_line, (20, 40),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 255, 255), 2, cv2.LINE_AA)
@@ -401,10 +349,8 @@ def main():
             pct = 100 * read_idx // total_frames
             print(f"\r  {pct:3d}%  [{fmt_timestamp(read_idx / src_fps)}]", end="", flush=True)
 
-    # Finalize any open combo at end of video
     if combo_count >= 2:
-        name = COMBO_NAMES.get(combo_count, f"{combo_count}x")
-        combos.append((combo_count, name))
+        combos.append((combo_count, COMBO_NAMES.get(combo_count, f"{combo_count}x")))
 
     cap.release()
     log_file.close()
