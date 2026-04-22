@@ -1,15 +1,18 @@
 """
 assist_test_dash_mk2p1.py
 --------------------------
-One-shot helper: samples the dash icon contour from each slot's source video,
-saves them to .npy files, and outputs annotated images for verification.
+One-shot helper: samples the dash icon contour AND label strip contour from
+each slot's source video, saves them to .npy files, and outputs annotated
+images for verification.
 
 Right slot (slot2): unsorted_videos/arakko 3.mp4  @ 7.95s
-Left  slot (slot3): unsorted_videos/krakoa.mp4     @ 12.04s
+Left  slot (slot3): unsorted_videos/krakoa.mp4     @ 17.33s
 
 Outputs:
     test/contour_verify_right.jpg
     test/contour_verify_left.jpg
+    test/contour_verify_label_right.jpg
+    test/contour_verify_label_left.jpg
 
 Usage:
     python assist_test_dash_mk2p1.py
@@ -20,17 +23,29 @@ import numpy as np
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
-RIGHT_VIDEO      = "unsorted_videos/arakko 3.mp4"
+# Dash icon (slot x)
+RIGHT_VIDEO      = "unsorted_videos/arakko 3 - 3 kill - 11 dashes.mp4"
 RIGHT_SAMPLE_SEC = 7.95
 RIGHT_SEARCH     = (1575, 1625, 965, 1000)   # (x0, x1, y0, y1)
-RIGHT_SAVE_PATH  = "reference pictures/slot_x_contour_right.npy"
+RIGHT_SAVE_PATH  = "models/slot_x_contour_right.npy"
 RIGHT_IMAGE_OUT  = "test/contour_verify_right.jpg"
 
-LEFT_VIDEO       = "unsorted_videos/krakoa.mp4"
-LEFT_SAMPLE_SEC  = 17.33
+LEFT_VIDEO       = "unsorted_videos/hall of djalia 3k.mp4"
+LEFT_SAMPLE_SEC  = 5.0
 LEFT_SEARCH      = (1500, 1550, 965, 1000)
-LEFT_SAVE_PATH   = "reference pictures/slot_x_contour_left.npy"
+LEFT_SAVE_PATH   = "models/slot_x_contour_left.npy"
 LEFT_IMAGE_OUT   = "test/contour_verify_left.jpg"
+
+# Label strips (LSHIFT keybind text) — sampled when ability is ready (not mid-dash)
+RIGHT_LABEL_SAMPLE_SEC = 3.0
+RIGHT_LABEL_SEARCH     = (1575, 1625, 1030, 1050)
+RIGHT_LABEL_SAVE       = "models/label_slot2_contour.npy"
+RIGHT_LABEL_IMG_OUT    = "test/contour_verify_label_right.jpg"
+
+LEFT_LABEL_SAMPLE_SEC  = 15.0
+LEFT_LABEL_SEARCH      = (1500, 1550, 1030, 1050)
+LEFT_LABEL_SAVE        = "models/label_slot3_contour.npy"
+LEFT_LABEL_IMG_OUT     = "test/contour_verify_label_left.jpg"
 
 WHITE_THRESH = 200
 ZOOM         = 10
@@ -115,13 +130,19 @@ def process(video_path, sample_sec, search, save_path, image_out, label):
 
 def main():
     Path("test").mkdir(exist_ok=True)
-    Path("reference pictures").mkdir(exist_ok=True)
+    Path("models").mkdir(exist_ok=True)
 
     process(RIGHT_VIDEO, RIGHT_SAMPLE_SEC, RIGHT_SEARCH,
             RIGHT_SAVE_PATH, RIGHT_IMAGE_OUT, "RIGHT/slot2")
 
     process(LEFT_VIDEO,  LEFT_SAMPLE_SEC,  LEFT_SEARCH,
             LEFT_SAVE_PATH,  LEFT_IMAGE_OUT,  "LEFT/slot3")
+
+    process(RIGHT_VIDEO, RIGHT_LABEL_SAMPLE_SEC, RIGHT_LABEL_SEARCH,
+            RIGHT_LABEL_SAVE, RIGHT_LABEL_IMG_OUT, "LABEL-RIGHT/slot2")
+
+    process(LEFT_VIDEO,  LEFT_LABEL_SAMPLE_SEC,  LEFT_LABEL_SEARCH,
+            LEFT_LABEL_SAVE,  LEFT_LABEL_IMG_OUT,  "LABEL-LEFT/slot3")
 
 
 if __name__ == "__main__":

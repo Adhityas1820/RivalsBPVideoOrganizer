@@ -2,8 +2,7 @@
 dash_counter.py
 ---------------
 Counts dashes in Marvel Rivals gameplay clips using contour-based white
-detection + zoom exclusion. Also classifies dash combos (Double/Triple/Quad/Penta)
-by tracking when the label turns non-white (ability on cooldown).
+detection + zoom exclusion.
 
 Usage:
     python dash_counter.py
@@ -27,23 +26,22 @@ PROCESS_FPS = 60
 
 SLOT2_SEARCH = (1575, 1625, 965, 1000)
 SLOT3_SEARCH = (1500, 1550, 965, 1000)
-SLOT2_LABEL  = (1575, 1625, 1008, 1050)
-SLOT3_LABEL  = (1500, 1550, 1008, 1050)
-SLOT_DETECT_FRAMES = 30
+SLOT2_LABEL  = (1575, 1625, 1030, 1050)
+SLOT3_LABEL  = (1500, 1550, 1030, 1050)
+SLOT_DETECT_FRAMES = 240
 
-RIGHT_CONTOUR_PATH = "reference pictures/slot_x_contour_right.npy"
-LEFT_CONTOUR_PATH  = "reference pictures/slot_x_contour_left.npy"
+RIGHT_CONTOUR_PATH = "models/slot_x_contour_right.npy"
+LEFT_CONTOUR_PATH  = "models/slot_x_contour_left.npy"
 
 WHITE_THRESH       = 200
-WHITE_RATIO_THRESH = 1.0
-ZOOM_LOW_THRESH    = 0.2
-OFF_FRAMES         = 5
+WHITE_RATIO_THRESH = 0.95
+LABEL_GREY_THRESH  = 110
+ZOOM_LOW_THRESH    = 0.5
+OFF_FRAMES         = 3
 DASH_REARM_SECS    = 0.3
 
-LABEL_WHITE_THRESH  = 0.1   # label white ratio below this → ability on cooldown
-LABEL_STABLE_FRAMES = 10
-COMBO_GAP_SECS      = 0.9
-COMBO_NAMES         = {2: "Double", 3: "Triple", 4: "Quad", 5: "Penta"}
+COMBO_WINDOW_PER_DASH = 0.3   # window = n * 450ms from first dash (900ms=Double, 1350=Triple, 1800=Quad, 2250=Penta)
+COMBO_NAMES           = {2: "Double", 3: "Triple", 4: "Quad", 5: "Penta"}
 
 VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv", ".webm"}
 # ---------------------------------------------------------------------------
@@ -59,13 +57,15 @@ def open_video(video_path: Path):
     return cv2.VideoCapture(tmp.name), tmp.name
 
 
-def label_white_ratio(frame, x0, x1, y0, y1):
+def count_label_contours(frame, x0, x1, y0, y1) -> int:
     h, w = frame.shape[:2]
     crop = frame[min(y0,h):min(y1,h), min(x0,w):min(x1,w)]
     if crop.size == 0:
-        return 0.0
+        return 0
     gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-    return (gray > WHITE_THRESH).sum() / max(gray.size, 1)
+    _, mask = cv2.threshold(gray, LABEL_GREY_THRESH, 255, cv2.THRESH_BINARY)
+    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    return len(cnts)
 
 
 def white_ratio_in_contours(frame, contours, x0, y0, x1, y1):
@@ -113,33 +113,30 @@ def fmt_timestamp(seconds: float) -> str:
 
 
 def count_dashes(video_path: Path) -> tuple:
-    """
-    Returns (video_name, total_dashes, timestamp_strings, combos)
-    combos = list of (count, label) e.g. [(3, "Triple"), (2, "Double")]
-    """
+    """Returns (video_name, total_dashes, timestamp_strings, combos, dash_secs)"""
     cap, tmp_path = open_video(video_path)
     if not cap.isOpened():
-        return video_path.name, 0, [], []
+        return video_path.name, 0, [], [], []
 
     src_fps        = cap.get(cv2.CAP_PROP_FPS) or 30
     frame_interval = max(1, int(src_fps / PROCESS_FPS))
     rearm_frames   = int(DASH_REARM_SECS * src_fps)
 
-    # Detect which slot has the LSHIFT label
-    ratio2_acc = ratio3_acc = 0.0
+    # Detect which slot has the LSHIFT label by counting contours in left label box
+    left_cnts_acc = 0
     sampled = 0
     while sampled < SLOT_DETECT_FRAMES:
         ret, frame = cap.read()
         if not ret:
             break
-        ratio2_acc += label_white_ratio(frame, *SLOT2_LABEL)
-        ratio3_acc += label_white_ratio(frame, *SLOT3_LABEL)
+        left_cnts_acc += count_label_contours(frame, *SLOT3_LABEL)
         sampled += 1
     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
 
-    is_right      = ratio2_acc >= ratio3_acc
+    avg_cnts = left_cnts_acc / max(sampled, 1)
+    is_right = avg_cnts > 1
+    print(f"  [{video_path.name}] Dash slot: {'RIGHT (slot2)' if is_right else 'LEFT (slot3)'}  (avg contours: {avg_cnts:.2f})")
     slot_contours = load_contours(RIGHT_CONTOUR_PATH if is_right else LEFT_CONTOUR_PATH)
-    active_label  = SLOT2_LABEL if is_right else SLOT3_LABEL
 
     if slot_contours:
         rx, ry, rw, rh = cv2.boundingRect(np.concatenate(slot_contours).astype(np.int32))
@@ -147,24 +144,18 @@ def count_dashes(video_path: Path) -> tuple:
     else:
         sx0, sx1, sy0, sy1 = SLOT2_SEARCH if is_right else SLOT3_SEARCH
 
-    # Detection state
-    off_streak = 0
-    was_off    = True
-    rearm_at   = 0
+    off_streak   = 0
+    was_off      = True
+    rearm_at     = 0
     total_dashes = 0
     timestamps   = []
+    dash_secs    = []
 
-    # Combo state
-    label_is_grey          = False
-    label_candidate_grey   = False
-    label_candidate_streak = 0
-    label_stable_grey      = False
-    prev_label_stable_grey = False
-    combo_count            = 0
-    last_combo_dash_sec    = None
-    combos                 = []
+    combo_count      = 0
+    combo_start_sec  = None
+    combos           = []
 
-    read_idx = 0
+    read_idx     = 0
 
     while True:
         ret, frame = cap.read()
@@ -180,17 +171,22 @@ def count_dashes(video_path: Path) -> tuple:
                 total_dashes += 1
                 t_sec = read_idx / src_fps
                 timestamps.append(fmt_timestamp(t_sec))
+                dash_secs.append(t_sec)
                 rearm_at = read_idx + rearm_frames
                 was_off  = False
 
-                if label_stable_grey:
-                    if last_combo_dash_sec is None or (t_sec - last_combo_dash_sec) <= COMBO_GAP_SECS:
-                        combo_count += 1
+                if combo_start_sec is None:
+                    combo_start_sec = t_sec
+                    combo_count     = 1
+                else:
+                    new_count = combo_count + 1
+                    if (t_sec - combo_start_sec) <= new_count * COMBO_WINDOW_PER_DASH:
+                        combo_count = new_count
                     else:
                         if combo_count >= 2:
                             combos.append((combo_count, COMBO_NAMES.get(combo_count, f"{combo_count}x")))
-                        combo_count = 1
-                    last_combo_dash_sec = t_sec
+                        combo_start_sec = t_sec
+                        combo_count     = 1
 
             if not white_state:
                 off_streak += 1
@@ -199,28 +195,8 @@ def count_dashes(video_path: Path) -> tuple:
             else:
                 off_streak = 0
 
-            # Label stable state tracking
-            lbl_ratio     = label_white_ratio(frame, *active_label)
-            label_is_grey = lbl_ratio < LABEL_WHITE_THRESH
-            if label_is_grey == label_candidate_grey:
-                label_candidate_streak += 1
-            else:
-                label_candidate_grey   = label_is_grey
-                label_candidate_streak = 1
-            prev_label_stable_grey = label_stable_grey
-            if label_candidate_streak >= LABEL_STABLE_FRAMES:
-                label_stable_grey = label_candidate_grey
-
-            # Label went white → finalize open combo
-            if prev_label_stable_grey and not label_stable_grey:
-                if combo_count >= 2:
-                    combos.append((combo_count, COMBO_NAMES.get(combo_count, f"{combo_count}x")))
-                combo_count         = 0
-                last_combo_dash_sec = None
-
         read_idx += 1
 
-    # Finalize any combo still open at end of video
     if combo_count >= 2:
         combos.append((combo_count, COMBO_NAMES.get(combo_count, f"{combo_count}x")))
 
@@ -228,7 +204,7 @@ def count_dashes(video_path: Path) -> tuple:
     if tmp_path:
         Path(tmp_path).unlink(missing_ok=True)
 
-    return video_path.name, total_dashes, timestamps, combos
+    return video_path.name, total_dashes, timestamps, combos, dash_secs
 
 
 def _worker(video_path_str: str) -> tuple:
@@ -253,23 +229,44 @@ def main():
     with mp.Pool(processes=num_workers) as pool:
         all_results = pool.map(_worker, [str(v) for v in videos])
 
-    results = {}
-    for name, total, timestamps, combos in all_results:
+    Path(OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
+
+    # Write timestamps text file
+    txt_file = Path(OUTPUT_DIR) / "dash_timestamps.txt"
+    results  = {}
+    txt_lines = []
+
+    for name, total, timestamps, combos, dash_secs in all_results:
         times_str  = ", ".join(timestamps) if timestamps else "none"
-        combos_str = ", ".join(f"{label} ({n})" for n, label in combos) if combos else "none"
+        combos_str = ", ".join(f"{lbl} ({n})" for n, lbl in combos) if combos else "none"
         print(f"[{name}]")
         print(f"  Dashes : {total}")
         print(f"  Times  : {times_str}")
         print(f"  Combos : {combos_str}\n")
         results[name] = {"dashes": total, "timestamps": timestamps, "combos": [[n, lbl] for n, lbl in combos]}
 
-    Path(OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
+        txt_lines.append(f"=== {name} ===")
+        if dash_secs:
+            for i, (t, ts) in enumerate(zip(dash_secs, timestamps)):
+                if i == 0:
+                    txt_lines.append(f"  dash {i+1:>2}: {ts}")
+                else:
+                    delta = t - dash_secs[i - 1]
+                    txt_lines.append(f"  dash {i+1:>2}: {ts}  (delta: {delta:.3f}s)")
+        else:
+            txt_lines.append("  no dashes detected")
+        txt_lines.append("")
+
+    with open(txt_file, "w") as f:
+        f.write("\n".join(txt_lines))
+
     out_file = Path(OUTPUT_DIR) / "results.json"
     with open(out_file, "w") as f:
         json.dump(results, f, indent=2)
 
     print("=" * 60)
-    print(f"Results saved to {out_file}")
+    print(f"Timestamps : {txt_file}")
+    print(f"JSON       : {out_file}")
 
 
 if __name__ == "__main__":

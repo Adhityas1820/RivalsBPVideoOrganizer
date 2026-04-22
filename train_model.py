@@ -31,7 +31,7 @@ VAL_RATIO     = 0.15
 # TEST_RATIO  = remainder (0.10)
 
 BATCH_SIZE    = 32
-NUM_EPOCHS    = 15
+NUM_EPOCHS    = 7
 LEARNING_RATE = 1e-4
 NUM_WORKERS   = 0      # 0 is safest on Windows; raise to 4 if you have many cores
 IMG_SIZE      = 224

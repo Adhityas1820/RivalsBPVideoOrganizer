@@ -29,6 +29,8 @@ Output:
 
 import shutil
 import tempfile
+import tkinter as tk
+from tkinter import ttk
 import cv2
 from pathlib import Path
 
@@ -134,6 +136,46 @@ def extract_frames(video_path: Path, output_dir: Path, interval_seconds: float, 
     return saved_count
 
 
+def pick_maps(all_map_dirs: list) -> list:
+    """Show a popup letting the user pick which maps to process. Returns selected dirs."""
+    selected = []
+
+    root = tk.Tk()
+    root.title("Select Maps to Process")
+    root.resizable(False, False)
+
+    tk.Label(root, text="Select maps to add to dataset_frames:", font=("Arial", 11)).pack(padx=16, pady=(12, 4))
+
+    frame = tk.Frame(root)
+    frame.pack(padx=16, pady=4)
+
+    scrollbar = tk.Scrollbar(frame, orient=tk.VERTICAL)
+    listbox = tk.Listbox(frame, selectmode=tk.MULTIPLE, yscrollcommand=scrollbar.set,
+                         width=36, height=min(len(all_map_dirs), 16), font=("Arial", 10))
+    scrollbar.config(command=listbox.yview)
+    scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+    listbox.pack(side=tk.LEFT, fill=tk.BOTH)
+
+    for d in all_map_dirs:
+        listbox.insert(tk.END, d.name)
+
+    def on_ok():
+        for i in listbox.curselection():
+            selected.append(all_map_dirs[i])
+        root.destroy()
+
+    def on_all():
+        listbox.select_set(0, tk.END)
+
+    btn_frame = tk.Frame(root)
+    btn_frame.pack(pady=(4, 12))
+    tk.Button(btn_frame, text="Select All", width=12, command=on_all).pack(side=tk.LEFT, padx=6)
+    tk.Button(btn_frame, text="Process →", width=12, command=on_ok).pack(side=tk.LEFT, padx=6)
+
+    root.mainloop()
+    return selected
+
+
 def main():
     videos_root = Path(DATASET_VIDEOS_DIR)
     frames_root = Path(DATASET_FRAMES_DIR)
@@ -144,24 +186,27 @@ def main():
         return
 
     # Collect all map dirs — supports both flat and nested (Mode/Map/) layouts
-    map_dirs = []
+    all_map_dirs = []
     for entry in sorted(videos_root.iterdir()):
         if not entry.is_dir():
             continue
-        # Check if this is a game-mode folder (contains subdirs) or a map folder directly
         subdirs = [d for d in entry.iterdir() if d.is_dir()]
         if subdirs:
-            # It's a game-mode folder — each subdir is a map
-            map_dirs.extend(sorted(subdirs))
+            all_map_dirs.extend(sorted(subdirs))
         else:
-            # It's a flat map folder
-            map_dirs.append(entry)
+            all_map_dirs.append(entry)
 
-    if not map_dirs:
+    if not all_map_dirs:
         print(f"[ERROR] No map folders found inside '{DATASET_VIDEOS_DIR}/'.")
         return
 
-    print(f"Found {len(map_dirs)} map(s): {[d.name for d in map_dirs]}\n")
+    map_dirs = pick_maps(all_map_dirs)
+
+    if not map_dirs:
+        print("No maps selected. Exiting.")
+        return
+
+    print(f"Processing {len(map_dirs)} map(s): {[d.name for d in map_dirs]}\n")
 
     total_videos = 0
     total_frames = 0
@@ -178,9 +223,11 @@ def main():
             print(f"[WARNING] No videos in '{map_name}/', skipping.\n")
             continue
 
-        print(f"--- {map_name} ({len(videos)} video(s)) ---")
+        # Count existing frames so new ones don't overwrite them
+        existing = len(list(out_dir.glob("frame_*.jpg"))) if out_dir.exists() else 0
+        print(f"--- {map_name} ({len(videos)} video(s), {existing} frames already) ---")
 
-        frame_cursor = 0
+        frame_cursor = existing
         for vid in videos:
             print(f"  {vid.name}")
             n = extract_frames(vid, out_dir, FRAME_INTERVAL_SECONDS, start_idx=frame_cursor)
