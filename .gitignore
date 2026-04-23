@@ -11,9 +11,21 @@ dash_counts/
 debug_crops/
 test/
 
-# Reference pictures (contour .npy files are small, keep them)
-reference pictures/*.jpg
-reference pictures/*.png
+# Reference / scratch
+reference pictures/
+garbage/
+
+# Dev / test scripts
+test_kill_counter*.py
+test_dash_counter*.py
+assist_test_*.py
+game_mode_selectmk*.py
+debug_crop.py
+debug_frames.py
+clear_data.py
+predict_and_sort.py
+process_data.py
+train_model.py
 
 # Python
 __pycache__/
@@ -32,3 +44,10 @@ venv/
 
 # Claude internal
 .claude/
+
+# Unused / old model files
+models/game_mode_classifier.pth
+models/kill_slot_contour.npy
+models/label_slot2_contour.npy
+models/label_slot3_contour.npy
+models/slot_x_contour.npy

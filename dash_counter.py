@@ -125,7 +125,8 @@ def count_dashes(video_path: Path) -> tuple:
     # Detect which slot has the LSHIFT label by counting contours in left label box
     left_cnts_acc = 0
     sampled = 0
-    while sampled < SLOT_DETECT_FRAMES:
+    for fi in range(0, SLOT_DETECT_FRAMES, 10):
+        cap.set(cv2.CAP_PROP_POS_FRAMES, fi)
         ret, frame = cap.read()
         if not ret:
             break
