@@ -40,7 +40,7 @@ ZOOM_LOW_THRESH    = 0.5
 OFF_FRAMES         = 3
 DASH_REARM_SECS    = 0.3
 
-COMBO_WINDOW_PER_DASH = 0.3   # window = n * 450ms from first dash (900ms=Double, 1350=Triple, 1800=Quad, 2250=Penta)
+# combo window = 450(n-1) + 100 ms  →  Double:550ms, Triple:1000ms, Quad:1450ms, Penta:1900ms
 COMBO_NAMES           = {2: "Double", 3: "Triple", 4: "Quad", 5: "Penta"}
 
 VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv", ".webm"}
@@ -181,7 +181,7 @@ def count_dashes(video_path: Path) -> tuple:
                     combo_count     = 1
                 else:
                     new_count = combo_count + 1
-                    if (t_sec - combo_start_sec) <= new_count * COMBO_WINDOW_PER_DASH:
+                    if (t_sec - combo_start_sec) <= 0.45 * (new_count - 1) + 0.275:
                         combo_count = new_count
                     else:
                         if combo_count >= 2:

@@ -71,7 +71,8 @@ ABILITY_COLOR_THRESH = 0.90
 
 DIST_MAX_WIDE      = 90
 WIDE_DELAY_SECS    = 1
-WIDE_DURATION_SECS = 0.7
+WIDE_DURATION_SECS = 5.15
+UK_LATCH_MARGIN    = 3
 
 VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv", ".webm"}
 # ---------------------------------------------------------------------------
@@ -94,21 +95,22 @@ def load_contours(path):
     return list(np.load(str(p), allow_pickle=True))
 
 
-def row_is_lit(crop: np.ndarray, dist_max: int = DIST_MAX) -> bool:
+def row_is_lit(crop: np.ndarray, dist_max: int = DIST_MAX) -> tuple:
+    """Returns (is_lit, dist). dist is -1.0 if ratio or contour check fails early."""
     b, g, r = crop[:,:,0], crop[:,:,1], crop[:,:,2]
     white_mask = (r > WHITE_THRESH) & (g > WHITE_THRESH) & (b > WHITE_THRESH)
     ratio = white_mask.sum() / white_mask.size
     if ratio < ROW_WHITE_RATIO:
-        return False
+        return False, -1.0
     mask = white_mask.astype(np.uint8) * 255
     cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     top2 = sorted(cnts, key=cv2.contourArea, reverse=True)[:2]
     if len(top2) < 2:
-        return False
+        return False, -1.0
     pts1 = top2[0].reshape(-1, 2).astype(np.float32)
     pts2 = top2[1].reshape(-1, 2).astype(np.float32)
     dist = float(np.linalg.norm(pts1[:, None] - pts2[None, :], axis=2).min())
-    return DIST_MIN <= dist <= dist_max
+    return DIST_MIN <= dist <= dist_max, dist
 
 
 def slot_is_white(frame, contours, x0, x1, y0, y1) -> bool:
@@ -146,19 +148,26 @@ def count_kills(video_path: Path, contours1: list, contours2: list) -> tuple:
     src_fps        = cap.get(cv2.CAP_PROP_FPS) or 30
     frame_interval = max(1, int(src_fps / PROCESS_FPS))
 
-    pending_kill_timers = []
-    candidate_count     = 0
-    streak              = 0
-    total_kills         = 0
-    timestamps          = []
-    board_on            = False
-    kill_locked_until   = 0.0
-    read_idx            = 0
+    total_kills = 0
+    timestamps  = []
 
+    board_on = False
+    kill_locked_until = 0.0
+    read_idx = 0
+
+    nrows = len(ROW_Y_STARTS)
+    row_has = [False] * nrows
+
+    # --- Unified tracking ---
+    lit_cand   = 0
+    lit_streak = 0
+    lit_stable = 0
+    lit_timers = []
+
+    # --- Ability ---
     ability_is_yellow  = False
     wide_dist_start_at = -1.0
     wide_dist_end_at   = -1.0
-    cur_dist_max       = DIST_MAX
 
     while True:
         ret, frame = cap.read()
@@ -169,65 +178,84 @@ def count_kills(video_path: Path, contours1: list, contours2: list) -> tuple:
             hf, wf = frame.shape[:2]
             t_sec  = read_idx / src_fps
 
-            # Ability indicator: detect yellow→blue transition
+            # --- Ability detection ---
             ab_crop = frame[min(ABILITY_Y0,hf):min(ABILITY_Y1,hf),
                             min(ABILITY_X0,wf):min(ABILITY_X1,wf)]
+
             if ab_crop.size > 0:
                 b_ab, g_ab, r_ab = ab_crop[:,:,0], ab_crop[:,:,1], ab_crop[:,:,2]
                 n_px = ab_crop.shape[0] * ab_crop.shape[1]
+
                 yellow_r = ((r_ab > YELLOW_R_MIN) & (g_ab > YELLOW_G_MIN) & (b_ab < YELLOW_B_MAX)).sum() / n_px
                 blue_r   = ((b_ab > BLUE_B_MIN) & (b_ab > r_ab) & (b_ab > g_ab)).sum() / n_px
+
                 is_yellow_now = yellow_r >= ABILITY_COLOR_THRESH
                 is_blue_now   = blue_r   >= ABILITY_COLOR_THRESH
+
                 if ability_is_yellow and is_blue_now:
                     wide_dist_start_at = t_sec + WIDE_DELAY_SECS
                     wide_dist_end_at   = t_sec + WIDE_DELAY_SECS + WIDE_DURATION_SECS
+
                 ability_is_yellow = is_yellow_now
+
             cur_dist_max = DIST_MAX_WIDE if (wide_dist_start_at <= t_sec <= wide_dist_end_at) else DIST_MAX
 
-            # Scoreboard detection
+            # --- Scoreboard ---
             s1 = slot_is_white(frame, contours1, SLOT1_X0, SLOT1_X1, SLOT1_Y0, SLOT1_Y1)
             s2 = slot_is_white(frame, contours2, SLOT2_X0, SLOT2_X1, SLOT2_Y0, SLOT2_Y1)
+
             prev_board_on = board_on
-            board_on      = s1 or s2
+            board_on = s1 or s2
+
             if prev_board_on and not board_on:
                 kill_locked_until = t_sec + BOARD_LOCKOUT
 
-            lit = sum(
-                1 for y0 in ROW_Y_STARTS
-                if row_is_lit(frame[y0:min(y0+ROW_H,hf), min(X_START,wf):min(X_END,wf)], cur_dist_max)
-            )
-
-            if lit == candidate_count:
-                streak += 1
-            else:
-                candidate_count = lit
-                streak          = 1
-
             locked = board_on or t_sec < kill_locked_until
 
-            # Count kills immediately when lit count stabilises with new uncovered rows
-            if streak == STABLE_FRAMES and not locked:
-                uncovered = candidate_count - len(pending_kill_timers)
+            # --- Row detection ---
+            for ri, y0 in enumerate(ROW_Y_STARTS):
+                crop = frame[y0:min(y0+ROW_H,hf), min(X_START,wf):min(X_END,wf)]
+                is_lit, _ = row_is_lit(crop, cur_dist_max)
+                row_has[ri] = is_lit
+
+            # --- Unified count ---
+            lit_cur = sum(row_has)
+
+            if lit_cur == lit_cand:
+                lit_streak += 1
+            else:
+                lit_cand   = lit_cur
+                lit_streak = 1
+
+            if lit_streak >= STABLE_FRAMES:
+                lit_stable = lit_cand
+
+            # --- Kill logic ---
+            if not locked:
+                uncovered = lit_stable - len(lit_timers)
+
                 if uncovered > 0:
                     total_kills += uncovered
                     t = fmt_timestamp(t_sec)
+
                     for _ in range(uncovered):
                         timestamps.append(t)
-                        pending_kill_timers.append(t_sec + KILL_TIMER_SECS)
+                        lit_timers.append(t_sec + KILL_TIMER_SECS)
 
-            # Fire expired timers — detect replacement kills (simultaneous fade/replace)
-            if not locked:
-                fired = sum(1 for e in pending_kill_timers if t_sec >= e)
+                fired = sum(1 for e in lit_timers if t_sec >= e)
+
                 if fired > 0:
-                    pending_kill_timers[:] = [e for e in pending_kill_timers if t_sec < e]
-                    uncovered = candidate_count - len(pending_kill_timers)
+                    lit_timers[:] = [e for e in lit_timers if t_sec < e]
+
+                    uncovered = lit_stable - len(lit_timers)
+
                     if uncovered > 0:
                         total_kills += uncovered
                         t = fmt_timestamp(t_sec)
+
                         for _ in range(uncovered):
                             timestamps.append(t)
-                            pending_kill_timers.append(t_sec + KILL_TIMER_SECS)
+                            lit_timers.append(t_sec + KILL_TIMER_SECS)
 
         read_idx += 1
 
@@ -236,7 +264,6 @@ def count_kills(video_path: Path, contours1: list, contours2: list) -> tuple:
         Path(tmp_path).unlink(missing_ok=True)
 
     return video_path.name, total_kills, timestamps
-
 
 def _worker(args: tuple) -> tuple:
     video_path_str, contours1, contours2 = args
