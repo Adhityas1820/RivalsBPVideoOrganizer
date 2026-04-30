@@ -28,7 +28,8 @@ SORTED_DIR       = "final"
 MAP_MODEL_PATH   = "models/map_classifier.pth"
 VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv", ".webm"}
 
-FRAME_INTERVAL_SECONDS = 2
+USE_DOMINATION_FILTER  = False   # set False to skip game-mode pre-filtering and allow all maps
+FRAME_INTERVAL_SECONDS = 0.5
 IMG_SIZE = 224
 DOMINATION_MAPS = {
     "Birnin TChalla", "Celestial Husk", "Hells Heaven",
@@ -157,6 +158,11 @@ class RivalsApp:
         self._progress   = 0
         self._chip_btns  = {}
 
+        self._cb_map    = tk.BooleanVar(value=True)
+        self._cb_kills  = tk.BooleanVar(value=True)
+        self._cb_dashes = tk.BooleanVar(value=True)
+        self._cb_combos = tk.BooleanVar(value=True)
+
         self._f_home = tk.Frame(root, bg=BG)
         self._f_proc = tk.Frame(root, bg=BG)
         self._f_res  = tk.Frame(root, bg=BG)
@@ -226,11 +232,24 @@ class RivalsApp:
         self._lbl_model.pack(anchor='w', pady=(8, 0))
         self._check_model()
 
+        # Classifier toggles
+        cr = tk.Frame(fp, bg=PANEL)
+        cr.pack(anchor='w', pady=(10, 0))
+        self._label(cr, 'Run:', size=8, fg=DIM).pack(side='left', padx=(0, 10))
+        for text, var in [('Map', self._cb_map), ('Kills', self._cb_kills), ('Dashes', self._cb_dashes), ('Combos', self._cb_combos)]:
+            tk.Checkbutton(cr, text=text, variable=var,
+                           bg=PANEL, fg=TEXT, selectcolor=BG,
+                           activebackground=PANEL, activeforeground=TEXT,
+                           font=('Segoe UI', 9),
+                           command=self._on_cb_change).pack(side='left', padx=(0, 14))
+
         # Buttons
         row = tk.Frame(root, bg=BG)
         row.pack(fill='x', padx=20, pady=(0, 20))
         self._btn(row, 'Browse...', self._pick,
                   fg=PURPLE2, bg=BORDER, hover_bg='#3d3860').pack(side='left')
+        self._btn(row, 'Exit', self.root.destroy,
+                  fg=ERR, bg=PANEL, hover_bg='#2a1111').pack(side='left', padx=(8, 0))
         self._btn_go = self._btn(row, 'PROCESS CLIPS', self._start,
                                  fg='#ffffff', bg=PURPLE, hover_bg='#9f7aea',
                                  state='disabled')
@@ -242,6 +261,12 @@ class RivalsApp:
             self._lbl_model.config(text='✓  Model ready', fg=GRN)
         else:
             self._lbl_model.config(text='✗  Model not found — run train_model.py', fg=ERR)
+
+    def _on_cb_change(self):
+        n          = len(self._selected)
+        map_needed = self._cb_map.get()
+        ready      = n > 0 and (not map_needed or Path(MAP_MODEL_PATH).exists())
+        self._btn_go.config(state='normal' if ready else 'disabled')
 
     def _pick(self):
         paths = filedialog.askopenfilenames(
@@ -255,8 +280,7 @@ class RivalsApp:
             self._lb.insert('end', f'  {p.name}')
         n = len(self._selected)
         self._lbl_files.config(text=f'{n} file{"s" if n != 1 else ""} selected', fg=PURPLE2)
-        if n > 0 and Path(MAP_MODEL_PATH).exists():
-            self._btn_go.config(state='normal')
+        self._on_cb_change()
 
     # ── proc view ─────────────────────────────────────────────────────────
 
@@ -341,6 +365,7 @@ class RivalsApp:
         n = len(clips)
         self._label(hrow, f'{n} clip{"s" if n != 1 else ""} processed',
                     size=8, fg=DIM).pack(side='left')
+        self._btn(hrow, 'Exit', self.root.destroy, fg=ERR, bg=PANEL, hover_bg='#2a1111').pack(side='right', padx=(6, 0))
         self._btn(hrow, 'Process More', self._back, fg=DIM).pack(side='right', padx=(6, 0))
         self._btn(hrow, 'Download ZIP', self._save_zip, fg=PURPLE2).pack(side='right')
 
@@ -572,100 +597,148 @@ class RivalsApp:
 
     def _pipeline(self):
         try:
-            videos = self._selected
+            videos     = self._selected
+            run_map    = self._cb_map.get()
+            run_kills  = self._cb_kills.get()
+            run_dashes = self._cb_dashes.get()
+            run_combos = self._cb_combos.get()
+
             if not videos:
                 self._emit('error', message='No videos selected.')
                 return
-            if not Path(MAP_MODEL_PATH).exists():
+            if run_map and not Path(MAP_MODEL_PATH).exists():
                 self._emit('error', message=f'Model not found at {MAP_MODEL_PATH}.')
                 return
 
-            nw = max(1, mp.cpu_count() - 1)
-            self._emit('log', message=f'Processing {len(videos)} video(s)  |  workers: {nw}')
-            self._emit('stage', stage='kills_dashes', status='active')
-            self._emit('progress', value=5)
+            nw      = max(1, mp.cpu_count() - 1)
+            enabled = ' + '.join(x for x, b in [('Map', run_map), ('Kills', run_kills), ('Dashes', run_dashes), ('Combos', run_combos)] if b) or 'nothing'
+            self._emit('log', message=f'Processing {len(videos)} video(s)  |  workers: {nw}  |  running: {enabled}')
 
-            bc1 = load_kill_contours(BOARD_SLOT1_CONTOUR_PATH)
-            bc2 = load_kill_contours(BOARD_SLOT2_CONTOUR_PATH)
+            kills_map  = {}
+            dashes_map = {}
 
-            with mp.Pool(processes=nw) as pool:
-                kf = pool.map_async(_kill_worker, [(str(v), bc1, bc2) for v in videos])
-                df = pool.map_async(_dash_worker, [str(v) for v in videos])
-                kill_results = kf.get()
-                dash_results = df.get()
+            need_dashes = run_dashes or run_combos
+            if run_kills or need_dashes:
+                self._emit('stage', stage='kills_dashes', status='active')
+                self._emit('progress', value=5)
 
-            kills_map  = {nm: tot for nm, tot, _ in kill_results}
-            dashes_map = {nm: (tot, cb) for nm, tot, _, cb, __ in dash_results}
+                with mp.Pool(processes=nw) as pool:
+                    if run_kills and need_dashes:
+                        bc1 = load_kill_contours(BOARD_SLOT1_CONTOUR_PATH)
+                        bc2 = load_kill_contours(BOARD_SLOT2_CONTOUR_PATH)
+                        kf  = pool.map_async(_kill_worker, [(str(v), bc1, bc2) for v in videos])
+                        df  = pool.map_async(_dash_worker, [str(v) for v in videos])
+                        kill_results = kf.get()
+                        dash_results = df.get()
+                    elif run_kills:
+                        bc1 = load_kill_contours(BOARD_SLOT1_CONTOUR_PATH)
+                        bc2 = load_kill_contours(BOARD_SLOT2_CONTOUR_PATH)
+                        kill_results = pool.map(_kill_worker, [(str(v), bc1, bc2) for v in videos])
+                        dash_results = []
+                    else:
+                        dash_results = pool.map(_dash_worker, [str(v) for v in videos])
+                        kill_results = []
 
-            for nm, tot, _ in kill_results:
-                self._emit('log', message=f'  [{nm}]  kills {tot}')
-            for nm, tot, _, cb, __ in dash_results:
-                cs = ('  (' + ' - '.join(lbl for _, lbl in cb) + ')') if cb else ''
-                self._emit('log', message=f'  [{nm}]  dashes {tot}{cs}')
+                if run_kills:
+                    kills_map = {nm: tot for nm, tot, _ in kill_results}
+                    for nm, tot, _ in kill_results:
+                        self._emit('log', message=f'  [{nm}]  kills {tot}')
+                if need_dashes:
+                    dashes_map = {nm: (tot, cb) for nm, tot, _, cb, __ in dash_results}
+                    for nm, tot, _, cb, __ in dash_results:
+                        cs = ('  (' + ' - '.join(lbl for _, lbl in cb) + ')') if cb else ''
+                        self._emit('log', message=f'  [{nm}]  dashes {tot}{cs}')
+
+                self._emit('stage', stage='kills_dashes', status='done')
 
             self._emit('progress', value=40)
-            self._emit('stage', stage='kills_dashes', status='done')
-
-            self._emit('stage', stage='frames', status='active')
-            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-            self._emit('log', message=f'Device: {device}')
-            classifier, classes = load_map_classifier(MAP_MODEL_PATH, device)
-
-            with ThreadPoolExecutor(max_workers=nw) as ex:
-                video_data = list(ex.map(
-                    lambda vp: (extract_pil_frames(vp), is_domination(vp)[0]),
-                    videos))
-
-            self._emit('progress', value=65)
-            self._emit('stage', stage='frames', status='done')
-
-            self._emit('stage', stage='classify', status='active')
-            all_tensors, frame_counts, valid_idx = [], [], []
-            for i, (pil_frames, _) in enumerate(video_data):
-                if not pil_frames:
-                    frame_counts.append(0)
-                    continue
-                ts = [_transform(pf) for pf in pil_frames]
-                all_tensors.extend(ts)
-                frame_counts.append(len(ts))
-                valid_idx.append(i)
 
             map_by_name = {}
-            if all_tensors:
-                batch = torch.stack(all_tensors).to(device)
-                with torch.no_grad():
-                    all_probs = F.softmax(classifier(batch), dim=1).cpu().numpy()
-                ptr = 0
-                for i in valid_idx:
-                    cnt  = frame_counts[i]
-                    avg  = np.mean(all_probs[ptr:ptr + cnt], axis=0)
-                    ptr += cnt
-                    _, dom = video_data[i]
-                    allowed = (DOMINATION_MAPS if dom
-                               else {c for c in classes if c not in DOMINATION_MAPS})
-                    mask = np.array([c in allowed for c in classes], dtype=float)
-                    avg  = avg * mask
-                    best = int(np.argmax(avg))
-                    map_by_name[videos[i].name] = (classes[best], float(avg[best]))
+            if run_map:
+                self._emit('stage', stage='frames', status='active')
+                device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+                self._emit('log', message=f'Device: {device}')
+                classifier, classes = load_map_classifier(MAP_MODEL_PATH, device)
+
+                with ThreadPoolExecutor(max_workers=nw) as ex:
+                    video_data = list(ex.map(
+                        lambda vp: (extract_pil_frames(vp),
+                                   is_domination(vp)[0] if USE_DOMINATION_FILTER else False),
+                        videos))
+
+                self._emit('progress', value=65)
+                self._emit('stage', stage='frames', status='done')
+
+                self._emit('stage', stage='classify', status='active')
+                all_tensors, frame_counts, valid_idx = [], [], []
+                for i, (pil_frames, _) in enumerate(video_data):
+                    if not pil_frames:
+                        frame_counts.append(0)
+                        continue
+                    ts = [_transform(pf) for pf in pil_frames]
+                    all_tensors.extend(ts)
+                    frame_counts.append(len(ts))
+                    valid_idx.append(i)
+
+                if all_tensors:
+                    batch_size = len(all_tensors)
+                    all_probs  = None
+                    while batch_size >= 1:
+                        try:
+                            chunks = []
+                            with torch.no_grad():
+                                for i in range(0, len(all_tensors), batch_size):
+                                    mini = torch.stack(all_tensors[i:i+batch_size]).to(device)
+                                    chunks.append(F.softmax(classifier(mini), dim=1).cpu().numpy())
+                            all_probs = np.concatenate(chunks, axis=0)
+                            break
+                        except torch.cuda.OutOfMemoryError:
+                            torch.cuda.empty_cache()
+                            batch_size //= 2
+                            self._emit('log', message=f'  OOM — retrying with batch size {batch_size}')
+                    if all_probs is None:
+                        raise RuntimeError('Could not run inference even at batch size 1.')
+                    ptr = 0
+                    for i in valid_idx:
+                        cnt  = frame_counts[i]
+                        avg  = np.mean(all_probs[ptr:ptr + cnt], axis=0)
+                        ptr += cnt
+                        _, dom = video_data[i]
+                        allowed = (set(classes) if not USE_DOMINATION_FILTER
+                                   else DOMINATION_MAPS if dom
+                                   else {c for c in classes if c not in DOMINATION_MAPS})
+                        mask = np.array([c in allowed for c in classes], dtype=float)
+                        avg  = avg * mask
+                        best = int(np.argmax(avg))
+                        map_by_name[videos[i].name] = (classes[best], float(avg[best]))
+
+                self._emit('progress', value=80)
+                self._emit('stage', stage='classify', status='done')
 
             self._emit('progress', value=80)
-            self._emit('stage', stage='classify', status='done')
-
             self._emit('stage', stage='organize', status='active')
             Path(SORTED_DIR).mkdir(parents=True, exist_ok=True)
             results = []
             n = len(videos)
             for idx, vp in enumerate(videos):
                 nm = vp.name
-                if nm not in map_by_name:
-                    self._emit('log', message=f'  SKIP {nm}')
-                    continue
-                map_name, conf = map_by_name[nm]
+                map_name, conf = 'Unknown', 0
+                if run_map:
+                    if nm not in map_by_name:
+                        self._emit('log', message=f'  SKIP {nm}')
+                        continue
+                    map_name, conf = map_by_name[nm]
                 kills          = kills_map.get(nm, 0)
                 dashes, combos = dashes_map.get(nm, (0, []))
-                combo_str = (' - '.join(lbl for _, lbl in combos)) if combos else None
-                stem = (f'{map_name} - {dashes}d - {combo_str} - {kills}k'
-                        if combo_str else f'{map_name} - {dashes}d - {kills}k')
+                combo_str      = (' - '.join(lbl for _, lbl in combos)) if combos else None
+
+                parts = []
+                if run_map:               parts.append(map_name)
+                if run_dashes:            parts.append(f'{dashes}d')
+                if run_combos and combo_str: parts.append(combo_str)
+                if run_kills:             parts.append(f'{kills}k')
+                stem = ' - '.join(parts) if parts else vp.stem
+
                 dest = Path(SORTED_DIR) / f'{stem}{vp.suffix}'
                 c2 = 1
                 while dest.exists():
