@@ -14,6 +14,7 @@ test/
 # Reference / scratch
 reference pictures/
 garbage/
+trash/
 
 # Dev / test scripts
 test_kill_counter*.py

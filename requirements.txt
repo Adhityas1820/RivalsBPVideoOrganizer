@@ -3,3 +3,6 @@ torchvision>=0.16.0
 opencv-python>=4.8.0
 numpy>=1.24.0
 Pillow>=10.0.0
+pywebview>=5.0          # desktop app shell (app.py)
+pythonnet>=3.0          # Windows EdgeChromium backend for pywebview
+pyinstaller>=6.0        # build the standalone .exe (MarvelRivalsClassifier.spec)
