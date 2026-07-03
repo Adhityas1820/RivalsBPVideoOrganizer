@@ -15,7 +15,6 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 from torchvision import models, transforms
-from game_mode_select import is_domination
 from dash_counter import count_dashes
 from kill_counter import (count_kills, load_contours as load_kill_contours,
                           SLOT1_CONTOUR_PATH as BOARD_SLOT1_CONTOUR_PATH,
@@ -28,13 +27,8 @@ SORTED_DIR       = "final"
 MAP_MODEL_PATH   = "models/map_classifier.pth"
 VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv", ".webm"}
 
-USE_DOMINATION_FILTER  = False   # set False to skip game-mode pre-filtering and allow all maps
 FRAME_INTERVAL_SECONDS = 0.5
 IMG_SIZE = 224
-DOMINATION_MAPS = {
-    "Birnin TChalla", "Celestial Husk", "Hells Heaven",
-    "Krakoa", "Lower Manhattan", "Royal Palace",
-}
 BLACKOUT_BOXES = [
     (25,   600,  900, 1060),
     (1450, 1875, 900, 1065),
@@ -640,13 +634,13 @@ class RivalsApp:
                         kill_results = []
 
                 if run_kills:
-                    kills_map = {nm: tot for nm, tot, _ in kill_results}
-                    for nm, tot, _ in kill_results:
+                    kills_map = {nm: tot for nm, tot, _, __, ___ in kill_results}
+                    for nm, tot, _, __, ___ in kill_results:
                         self._emit('log', message=f'  [{nm}]  kills {tot}')
                 if need_dashes:
                     dashes_map = {nm: (tot, cb) for nm, tot, _, cb, __ in dash_results}
                     for nm, tot, _, cb, __ in dash_results:
-                        cs = ('  (' + ' - '.join(lbl for _, lbl in cb) + ')') if cb else ''
+                        cs = ('  (' + ' - '.join(lbl for _, lbl, *_ in cb) + ')') if cb else ''
                         self._emit('log', message=f'  [{nm}]  dashes {tot}{cs}')
 
                 self._emit('stage', stage='kills_dashes', status='done')
@@ -661,17 +655,14 @@ class RivalsApp:
                 classifier, classes = load_map_classifier(MAP_MODEL_PATH, device)
 
                 with ThreadPoolExecutor(max_workers=nw) as ex:
-                    video_data = list(ex.map(
-                        lambda vp: (extract_pil_frames(vp),
-                                   is_domination(vp)[0] if USE_DOMINATION_FILTER else False),
-                        videos))
+                    video_data = list(ex.map(extract_pil_frames, videos))
 
                 self._emit('progress', value=65)
                 self._emit('stage', stage='frames', status='done')
 
                 self._emit('stage', stage='classify', status='active')
                 all_tensors, frame_counts, valid_idx = [], [], []
-                for i, (pil_frames, _) in enumerate(video_data):
+                for i, pil_frames in enumerate(video_data):
                     if not pil_frames:
                         frame_counts.append(0)
                         continue
@@ -703,12 +694,6 @@ class RivalsApp:
                         cnt  = frame_counts[i]
                         avg  = np.mean(all_probs[ptr:ptr + cnt], axis=0)
                         ptr += cnt
-                        _, dom = video_data[i]
-                        allowed = (set(classes) if not USE_DOMINATION_FILTER
-                                   else DOMINATION_MAPS if dom
-                                   else {c for c in classes if c not in DOMINATION_MAPS})
-                        mask = np.array([c in allowed for c in classes], dtype=float)
-                        avg  = avg * mask
                         best = int(np.argmax(avg))
                         map_by_name[videos[i].name] = (classes[best], float(avg[best]))
 
@@ -730,7 +715,7 @@ class RivalsApp:
                     map_name, conf = map_by_name[nm]
                 kills          = kills_map.get(nm, 0)
                 dashes, combos = dashes_map.get(nm, (0, []))
-                combo_str      = (' - '.join(lbl for _, lbl in combos)) if combos else None
+                combo_str      = (' - '.join(lbl for _, lbl, *_ in combos)) if combos else None
 
                 parts = []
                 if run_map:               parts.append(map_name)

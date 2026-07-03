@@ -18,7 +18,8 @@ import numpy as np
 from . import config as C
 from . import features as feat
 from . import peaks as pk
-from .dnn import DNN
+# .dnn (and torch with it) is imported lazily in load_model() so that
+# model_ready() checks at app startup don't pull in torch.
 
 # Trained SDSNN checkpoint (bundled in models/).
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -39,6 +40,7 @@ def load_model():
     if _model is not None:
         return _model, _ckpt, _device
     import torch
+    from .dnn import DNN
     _device = "cuda" if torch.cuda.is_available() else "cpu"
     ck = torch.load(str(CKPT_PATH), map_location=_device)
     model = DNN(in_dim=ck.get("in_dim", C.FEAT_DIM),
@@ -66,25 +68,32 @@ def _fmt_timestamp(seconds: float) -> str:
 def combos_from_secs(dash_secs):
     """Group dash start-seconds into combos with the SAME widening time window
     as dash_counter: each new dash joins the run if it lands within
-    0.45*(n-1) + 0.275 s of the run's start. Returns [(count, label), ...]."""
+    0.45*(n-1) + 0.275 s of the run's start. Returns
+    [(count, label, start_sec, end_sec), ...]."""
     combos = []
     combo_count = 0
     combo_start = None
+    combo_last  = None
     for t_sec in dash_secs:
         if combo_start is None:
             combo_start = t_sec
+            combo_last  = t_sec
             combo_count = 1
         else:
             new_count = combo_count + 1
             if (t_sec - combo_start) <= 0.45 * (new_count - 1) + 0.275:
                 combo_count = new_count
+                combo_last  = t_sec
             else:
                 if combo_count >= 2:
-                    combos.append((combo_count, C.COMBO_NAMES.get(combo_count, f"{combo_count}x")))
+                    combos.append((combo_count, C.COMBO_NAMES.get(combo_count, f"{combo_count}x"),
+                                   combo_start, combo_last))
                 combo_start = t_sec
+                combo_last  = t_sec
                 combo_count = 1
     if combo_count >= 2:
-        combos.append((combo_count, C.COMBO_NAMES.get(combo_count, f"{combo_count}x")))
+        combos.append((combo_count, C.COMBO_NAMES.get(combo_count, f"{combo_count}x"),
+                       combo_start, combo_last))
     return combos
 
 

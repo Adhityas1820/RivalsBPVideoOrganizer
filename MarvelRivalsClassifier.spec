@@ -21,14 +21,15 @@ datas = [
 binaries = []
 hiddenimports = [
     'clr',                       # pythonnet — pywebview edgechromium backend
-    'pipeline', 'kill_counter', 'dash_counter', 'game_mode_select',
+    'pipeline', 'kill_counter', 'dash_counter', 'clip_export', 'video_io',
     # FDNN neural dash detector (imported lazily inside pipeline)
     'fdnn', 'fdnn.counter', 'fdnn.features', 'fdnn.dnn',
     'fdnn.peaks', 'fdnn.config',
 ]
 
-# Pull in everything the heavy native packages need.
-for pkg in ('torch', 'torchvision', 'cv2', 'PIL', 'numpy', 'webview'):
+# Pull in everything the heavy native packages need (imageio_ffmpeg bundles its
+# own ffmpeg binary as package data, picked up by collect_all the same way).
+for pkg in ('torch', 'torchvision', 'cv2', 'PIL', 'numpy', 'webview', 'imageio_ffmpeg'):
     try:
         d, b, h = collect_all(pkg)
         datas += d

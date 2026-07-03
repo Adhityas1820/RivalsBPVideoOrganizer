@@ -32,5 +32,4 @@ Read its STATUS.md and decisions.md before starting; offer to update them when d
     `run_pipeline` via `options['dash_method']` / `options['fdnn_threshold']`. Contour
     runs in the mp pool; FDNN runs in the main process (loads a torch model).
 - Output: clips renamed `MapName - Xd - [Combo] - Yk.ext` into `final/`.
-- Game-mode pre-filter exists but is off by default (`USE_DOMINATION_FILTER = False`).
 - Lots of `test_*` / `assist_*` / `garbage/` scripts are experiments, not the pipeline.

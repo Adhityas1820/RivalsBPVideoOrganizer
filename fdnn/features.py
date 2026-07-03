@@ -11,13 +11,12 @@ The backbone weights are loaded from ``models/resnet18_imagenet.pth`` when prese
 Output shape: [n_frames, FEAT_DIM], one row per decoded frame, in order.
 """
 
-import shutil
-import tempfile
 from pathlib import Path
 
 import cv2
 import numpy as np
 
+from video_io import open_video as _open_video
 from . import config as C
 
 # Bundled ImageNet ResNet18 weights (so the .exe works offline). Resolved
@@ -31,17 +30,6 @@ _backbone = None
 _device   = None
 _mean     = None
 _std      = None
-
-
-def _open_video(video_path: Path):
-    video_path = Path(video_path)
-    cap = cv2.VideoCapture(str(video_path))
-    if cap.isOpened():
-        return cap, None
-    tmp = tempfile.NamedTemporaryFile(suffix=video_path.suffix, delete=False)
-    tmp.close()
-    shutil.copy2(str(video_path), tmp.name)
-    return cv2.VideoCapture(tmp.name), tmp.name
 
 
 def _get_backbone():

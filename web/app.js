@@ -26,7 +26,10 @@ const state = {
   stages: [],
   modelReady: false,
   fdnnAvailable: false,
-  settings: { dash_method: 'contour', fdnn_threshold: 0.7 },
+  settings: {
+    dash_method: 'contour', fdnn_threshold: 0.7,
+    output_mode: 'rename', dash_clip_min: 2, kill_clip_min: 1, clip_pad_secs: 2.0,
+  },
 };
 
 const METHOD_LABEL = { contour: 'HUD slot contour', fdnn: 'FDNN neural net', hybrid: 'Contour + FDNN (max)' };
@@ -70,6 +73,10 @@ async function refreshStatus() {
       state.settings = {
         dash_method: set.dash_method || 'contour',
         fdnn_threshold: typeof set.fdnn_threshold === 'number' ? set.fdnn_threshold : 0.7,
+        output_mode: set.output_mode || 'rename',
+        dash_clip_min: typeof set.dash_clip_min === 'number' ? set.dash_clip_min : 2,
+        kill_clip_min: typeof set.kill_clip_min === 'number' ? set.kill_clip_min : 1,
+        clip_pad_secs: typeof set.clip_pad_secs === 'number' ? set.clip_pad_secs : 2.0,
       };
       if (typeof set.fdnn_available === 'boolean') state.fdnnAvailable = set.fdnn_available;
     }
@@ -101,6 +108,19 @@ function applySettingsToUI() {
   $('#thrRange').value = thr;
   $('#thrValue').textContent = Number(thr).toFixed(2);
   updateThresholdVisibility();
+
+  // output-mode radios
+  $$('input[name="outputMode"]').forEach((r) => {
+    r.checked = (r.value === state.settings.output_mode);
+    const card = r.closest('.method');
+    if (card) card.classList.toggle('selected', r.checked);
+  });
+
+  // clip options
+  $('#dashClipMin').value = state.settings.dash_clip_min;
+  $('#killClipMin').value = state.settings.kill_clip_min;
+  $('#clipPadSecs').value = state.settings.clip_pad_secs;
+  updateClipOptionsVisibility();
 }
 function updateThresholdVisibility() {
   const m = currentMethodSelection();
@@ -111,6 +131,14 @@ function currentMethodSelection() {
   const r = $('input[name="dashMethod"]:checked');
   return r ? r.value : state.settings.dash_method;
 }
+function updateClipOptionsVisibility() {
+  const show = (currentOutputModeSelection() === 'clip');
+  $('#clipOptionsCard').classList.toggle('disabled', !show);
+}
+function currentOutputModeSelection() {
+  const r = $('input[name="outputMode"]:checked');
+  return r ? r.value : state.settings.output_mode;
+}
 function openSettings() {
   applySettingsToUI();
   showView('settings');
@@ -119,19 +147,34 @@ async function saveSettings() {
   const a = api(); if (!a) return;
   const method = currentMethodSelection();
   const thr = parseFloat($('#thrRange').value) || 0.7;
-  const next = { dash_method: method, fdnn_threshold: thr };
+  const mode = currentOutputModeSelection();
+  const dashClipMin = parseInt($('#dashClipMin').value, 10) || 2;
+  const killClipMin = parseInt($('#killClipMin').value, 10) || 1;
+  const clipPadSecs = parseFloat($('#clipPadSecs').value) || 0;
+  const next = {
+    dash_method: method, fdnn_threshold: thr,
+    output_mode: mode, dash_clip_min: dashClipMin,
+    kill_clip_min: killClipMin, clip_pad_secs: clipPadSecs,
+  };
   let saved = next;
   try { saved = await a.set_settings(next); } catch (e) { /* keep local */ }
   state.settings = {
     dash_method: (saved && saved.dash_method) || method,
     fdnn_threshold: (saved && typeof saved.fdnn_threshold === 'number') ? saved.fdnn_threshold : thr,
+    output_mode: (saved && saved.output_mode) || mode,
+    dash_clip_min: (saved && typeof saved.dash_clip_min === 'number') ? saved.dash_clip_min : dashClipMin,
+    kill_clip_min: (saved && typeof saved.kill_clip_min === 'number') ? saved.kill_clip_min : killClipMin,
+    clip_pad_secs: (saved && typeof saved.clip_pad_secs === 'number') ? saved.clip_pad_secs : clipPadSecs,
   };
   applySettingsToUI();
   toast('Settings saved · ' + (METHOD_LABEL[state.settings.dash_method] || state.settings.dash_method));
   showView('home');
 }
 function resetSettings() {
-  state.settings = { dash_method: 'contour', fdnn_threshold: 0.7 };
+  state.settings = {
+    dash_method: 'contour', fdnn_threshold: 0.7,
+    output_mode: 'rename', dash_clip_min: 2, kill_clip_min: 1, clip_pad_secs: 2.0,
+  };
   applySettingsToUI();
 }
 
@@ -318,6 +361,7 @@ function renderClips(clips) {
           <span class="stat">Kills <b>${c.kills}</b></span>
           <span class="stat">Dashes <b>${c.dashes}</b></span>
           ${c.combos ? `<span class="stat combo">${esc(c.combos)}</span>` : ''}
+          ${c.clip_label ? `<span class="stat combo">${esc(c.clip_label)}</span>` : ''}
           <span class="stat conf">${c.conf}%</span>
         </div>
         <div class="clip-name" title="${esc(c.filename)}">${esc(c.filename)}</div>
@@ -371,15 +415,21 @@ function init() {
   $('#settingsBack').addEventListener('click', () => showView('home'));
   $('#settingsSave').addEventListener('click', saveSettings);
   $('#settingsReset').addEventListener('click', resetSettings);
+  const syncMethodCards = () => $$('.method').forEach((c) =>
+    c.classList.toggle('selected', c.querySelector('input').checked));
   $$('input[name="dashMethod"]').forEach((r) =>
     r.addEventListener('change', () => {
-      $$('.method').forEach((c) => c.classList.toggle('selected',
-        c.querySelector('input').checked));
+      syncMethodCards();
       updateThresholdVisibility();
     }));
   $('#thrRange').addEventListener('input', (e) => {
     $('#thrValue').textContent = Number(e.target.value).toFixed(2);
   });
+  $$('input[name="outputMode"]').forEach((r) =>
+    r.addEventListener('change', () => {
+      syncMethodCards();
+      updateClipOptionsVisibility();
+    }));
   ['fMap', 'fCombo', 'fSort', 'fKills', 'fDashes'].forEach((id) => {
     const el = $('#' + id);
     el.addEventListener('change', applyFilters);

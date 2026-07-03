@@ -18,12 +18,12 @@ Usage:
 """
 
 import json
-import shutil
-import tempfile
 import multiprocessing as mp
 import cv2
 import numpy as np
 from pathlib import Path
+
+from video_io import open_video, fmt_timestamp
 
 # ---------------------------------------------------------------------------
 # Config
@@ -50,6 +50,10 @@ DIST_MAX = 10
 
 STABLE_FRAMES    = 10
 KILL_TIMER_SECS  = 5.15
+
+# Kills within this many seconds of each other are grouped into one "streak"
+# for clip-worthiness purposes (mirrors dash_counter's combo grouping).
+KILL_STREAK_GAP_SECS = 6.0
 
 # Scoreboard slots
 SLOT1_X0, SLOT1_X1, SLOT1_Y0, SLOT1_Y1 = 760,  938,  232, 278
@@ -78,16 +82,6 @@ VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv", ".webm"}
 # ---------------------------------------------------------------------------
 
 
-def open_video(video_path: Path):
-    cap = cv2.VideoCapture(str(video_path))
-    if cap.isOpened():
-        return cap, None
-    tmp = tempfile.NamedTemporaryFile(suffix=video_path.suffix, delete=False)
-    tmp.close()
-    shutil.copy2(str(video_path), tmp.name)
-    return cv2.VideoCapture(tmp.name), tmp.name
-
-
 def load_contours(path):
     p = Path(path)
     if not p.exists():
@@ -113,7 +107,20 @@ def row_is_lit(crop: np.ndarray, dist_max: int = DIST_MAX) -> tuple:
     return DIST_MIN <= dist <= dist_max, dist
 
 
-def slot_is_white(frame, contours, x0, x1, y0, y1) -> bool:
+def build_slot_mask(contours, x0, x1, y0, y1):
+    """Precompute the static contour mask for a scoreboard slot — the contours
+    never change during a video, so drawing them per frame is wasted work.
+    Returns a bool mask sized to the slot box, or None when there are no contours."""
+    if not contours:
+        return None
+    mask = np.zeros((y1 - y0, x1 - x0), dtype=np.uint8)
+    shifted = [(c - np.array([[[x0, y0]]])).astype(np.int32) for c in contours]
+    cv2.drawContours(mask, shifted, -1, 255, thickness=cv2.FILLED)
+    return mask > 0
+
+
+def slot_is_white(frame, inside, x0, x1, y0, y1) -> bool:
+    """inside: precomputed bool mask from build_slot_mask (None = no contours)."""
     h, w = frame.shape[:2]
     crop = frame[min(y0,h):min(y1,h), min(x0,w):min(x1,w)]
     if crop.size == 0:
@@ -121,35 +128,56 @@ def slot_is_white(frame, contours, x0, x1, y0, y1) -> bool:
     b, g, r = crop[:,:,0], crop[:,:,1], crop[:,:,2]
     white = (r > WHITE_THRESH) & (g > WHITE_THRESH) & (b > WHITE_THRESH)
     box_ratio = white.sum() / white.size
-    if contours:
-        mask = np.zeros(crop.shape[:2], dtype=np.uint8)
-        shifted = [(c - np.array([[[x0, y0]]])).astype(np.int32) for c in contours]
-        cv2.drawContours(mask, shifted, -1, 255, thickness=cv2.FILLED)
-        total = mask.sum() // 255
+    if inside is not None:
+        ins = inside[:white.shape[0], :white.shape[1]]
+        total = ins.sum()
         if total == 0:
             return False
-        contour_ratio = ((white) & (mask > 0)).sum() / total
+        contour_ratio = (white & ins).sum() / total
     else:
         contour_ratio = box_ratio
     return contour_ratio >= SLOT_WHITE_RATIO and box_ratio <= BOX_MAX_RATIO
 
 
-def fmt_timestamp(seconds: float) -> str:
-    m = int(seconds) // 60
-    s = int(seconds) % 60
-    return f"{m}:{s:02d}"
+def group_kill_streaks(kill_secs, gap_secs: float = KILL_STREAK_GAP_SECS) -> list:
+    """Group kill timestamps (seconds) into streaks whenever consecutive kills
+    land within gap_secs of each other. Unlike dash combos, a lone kill still
+    forms a streak of 1 (so a kill-clip threshold of 1 works). Returns
+    [(count, start_sec, end_sec), ...]."""
+    if not kill_secs:
+        return []
+    streaks = []
+    start = last = kill_secs[0]
+    count = 1
+    for t_sec in kill_secs[1:]:
+        if t_sec - last <= gap_secs:
+            count += 1
+            last   = t_sec
+        else:
+            streaks.append((count, start, last))
+            start = last = t_sec
+            count = 1
+    streaks.append((count, start, last))
+    return streaks
 
 
 def count_kills(video_path: Path, contours1: list, contours2: list) -> tuple:
+    """Returns (video_name, total_kills, timestamp_strings, streaks, kill_secs).
+    streaks is a list of (count, start_sec, end_sec) tuples from group_kill_streaks()."""
     cap, tmp_path = open_video(video_path)
     if not cap.isOpened():
-        return video_path.name, 0, []
+        return video_path.name, 0, [], [], []
 
     src_fps        = cap.get(cv2.CAP_PROP_FPS) or 30
     frame_interval = max(1, int(src_fps / PROCESS_FPS))
 
+    # Static per-video contour masks (avoids redrawing them every frame).
+    mask1 = build_slot_mask(contours1, SLOT1_X0, SLOT1_X1, SLOT1_Y0, SLOT1_Y1)
+    mask2 = build_slot_mask(contours2, SLOT2_X0, SLOT2_X1, SLOT2_Y0, SLOT2_Y1)
+
     total_kills = 0
     timestamps  = []
+    kill_secs   = []
 
     board_on = False
     kill_locked_until = 0.0
@@ -201,8 +229,8 @@ def count_kills(video_path: Path, contours1: list, contours2: list) -> tuple:
             cur_dist_max = DIST_MAX_WIDE if (wide_dist_start_at <= t_sec <= wide_dist_end_at) else DIST_MAX
 
             # --- Scoreboard ---
-            s1 = slot_is_white(frame, contours1, SLOT1_X0, SLOT1_X1, SLOT1_Y0, SLOT1_Y1)
-            s2 = slot_is_white(frame, contours2, SLOT2_X0, SLOT2_X1, SLOT2_Y0, SLOT2_Y1)
+            s1 = slot_is_white(frame, mask1, SLOT1_X0, SLOT1_X1, SLOT1_Y0, SLOT1_Y1)
+            s2 = slot_is_white(frame, mask2, SLOT2_X0, SLOT2_X1, SLOT2_Y0, SLOT2_Y1)
 
             prev_board_on = board_on
             board_on = s1 or s2
@@ -240,6 +268,7 @@ def count_kills(video_path: Path, contours1: list, contours2: list) -> tuple:
 
                     for _ in range(uncovered):
                         timestamps.append(t)
+                        kill_secs.append(t_sec)
                         lit_timers.append(t_sec + KILL_TIMER_SECS)
 
                 fired = sum(1 for e in lit_timers if t_sec >= e)
@@ -255,6 +284,7 @@ def count_kills(video_path: Path, contours1: list, contours2: list) -> tuple:
 
                         for _ in range(uncovered):
                             timestamps.append(t)
+                            kill_secs.append(t_sec)
                             lit_timers.append(t_sec + KILL_TIMER_SECS)
 
         read_idx += 1
@@ -263,7 +293,8 @@ def count_kills(video_path: Path, contours1: list, contours2: list) -> tuple:
     if tmp_path:
         Path(tmp_path).unlink(missing_ok=True)
 
-    return video_path.name, total_kills, timestamps
+    streaks = group_kill_streaks(kill_secs)
+    return video_path.name, total_kills, timestamps, streaks, kill_secs
 
 def _worker(args: tuple) -> tuple:
     video_path_str, contours1, contours2 = args
@@ -295,12 +326,13 @@ def main():
         all_results = pool.map(_worker, args)
 
     results = {}
-    for name, total, timestamps in all_results:
+    for name, total, timestamps, streaks, kill_secs in all_results:
         times_str = ", ".join(timestamps) if timestamps else "none"
         print(f"[{name}]")
         print(f"  Kills : {total}")
         print(f"  Times : {times_str}\n")
-        results[name] = {"kills": total, "timestamps": timestamps}
+        results[name] = {"kills": total, "timestamps": timestamps,
+                         "streaks": [[c, s, e] for c, s, e in streaks]}
 
     Path(OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
     out_file = Path(OUTPUT_DIR) / "results.json"

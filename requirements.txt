@@ -6,3 +6,4 @@ Pillow>=10.0.0
 pywebview>=5.0          # desktop app shell (app.py)
 pythonnet>=3.0          # Windows EdgeChromium backend for pywebview
 pyinstaller>=6.0        # build the standalone .exe (MarvelRivalsClassifier.spec)
+imageio-ffmpeg>=0.5.0   # bundled ffmpeg binary for clip trimming (clip_export.py)

@@ -26,7 +26,6 @@ pip install -r requirements.txt
 main.py
 kill_counter.py
 dash_counter.py
-game_mode_select.py
 requirements.txt
 models/
   map_classifier.pth

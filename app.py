@@ -57,6 +57,10 @@ def _settings_path() -> Path:
 DEFAULT_SETTINGS = {
     "dash_method": pipeline.DASH_METHOD,        # 'contour' | 'fdnn' | 'hybrid'
     "fdnn_threshold": pipeline.FDNN_THRESHOLD,  # 0.05 .. 0.95
+    "output_mode": pipeline.OUTPUT_MODE,        # 'rename' | 'clip'
+    "dash_clip_min": pipeline.DASH_CLIP_MIN,    # 2=Double .. 5=Penta
+    "kill_clip_min": pipeline.KILL_CLIP_MIN,    # minimum kills in a streak
+    "clip_pad_secs": pipeline.CLIP_PAD_SECS,    # 0.0 .. 10.0
 }
 
 
@@ -107,15 +111,40 @@ class Api:
         return s
 
     def set_settings(self, settings):
-        method = str((settings or {}).get("dash_method", "contour")).lower()
+        settings = settings or {}
+        method = str(settings.get("dash_method", "contour")).lower()
         if method not in ("contour", "fdnn", "hybrid"):
             method = "contour"
         try:
-            thr = float((settings or {}).get("fdnn_threshold", pipeline.FDNN_THRESHOLD))
+            thr = float(settings.get("fdnn_threshold", pipeline.FDNN_THRESHOLD))
         except (TypeError, ValueError):
             thr = pipeline.FDNN_THRESHOLD
         thr = max(0.05, min(0.95, thr))
-        self._settings = {"dash_method": method, "fdnn_threshold": thr}
+
+        mode = str(settings.get("output_mode", "rename")).lower()
+        if mode not in ("rename", "clip"):
+            mode = "rename"
+        try:
+            dash_min = int(settings.get("dash_clip_min", pipeline.DASH_CLIP_MIN))
+        except (TypeError, ValueError):
+            dash_min = pipeline.DASH_CLIP_MIN
+        dash_min = dash_min if dash_min in (2, 3, 4, 5) else pipeline.DASH_CLIP_MIN
+        try:
+            kill_min = int(settings.get("kill_clip_min", pipeline.KILL_CLIP_MIN))
+        except (TypeError, ValueError):
+            kill_min = pipeline.KILL_CLIP_MIN
+        kill_min = max(1, kill_min)
+        try:
+            pad = float(settings.get("clip_pad_secs", pipeline.CLIP_PAD_SECS))
+        except (TypeError, ValueError):
+            pad = pipeline.CLIP_PAD_SECS
+        pad = max(0.0, min(10.0, pad))
+
+        self._settings = {
+            "dash_method": method, "fdnn_threshold": thr,
+            "output_mode": mode, "dash_clip_min": dash_min,
+            "kill_clip_min": kill_min, "clip_pad_secs": pad,
+        }
         _save_settings(self._settings)
         return self.get_settings()
 
@@ -126,7 +155,7 @@ class Api:
         paths = self._window.create_file_dialog(
             webview.OPEN_DIALOG, allow_multiple=True, file_types=ftypes)
         if not paths:
-            return [c.export() for c in self._clips_payload()]  # unchanged
+            return self._files_payload()   # dialog cancelled — keep selection
         self._videos = [Path(p) for p in paths]
         return self._files_payload()
 
@@ -150,18 +179,16 @@ class Api:
     def _files_payload(self):
         return {"files": [{"name": v.name, "path": str(v)} for v in self._videos]}
 
-    def _clips_payload(self):
-        return []
-
     # ── processing ───────────────────────────────────────────────────────────
 
     def start(self, options):
         if not self._videos:
             return {"ok": False, "error": "No files selected."}
         options = dict(options or {})
-        # Inject the persisted dash settings unless the UI already supplied them.
-        options.setdefault("dash_method", self._settings.get("dash_method"))
-        options.setdefault("fdnn_threshold", self._settings.get("fdnn_threshold"))
+        # Inject the persisted settings unless the UI already supplied them.
+        for key in ("dash_method", "fdnn_threshold", "output_mode",
+                    "dash_clip_min", "kill_clip_min", "clip_pad_secs"):
+            options.setdefault(key, self._settings.get(key))
         videos = list(self._videos)
         threading.Thread(
             target=self._run, args=(videos, options), daemon=True).start()

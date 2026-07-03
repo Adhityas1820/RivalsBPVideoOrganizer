@@ -9,12 +9,12 @@ Usage:
 """
 
 import json
-import shutil
-import tempfile
 import multiprocessing as mp
 import cv2
 import numpy as np
 from pathlib import Path
+
+from video_io import open_video, fmt_timestamp
 
 # ---------------------------------------------------------------------------
 # Config
@@ -47,16 +47,6 @@ VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv", ".webm"}
 # ---------------------------------------------------------------------------
 
 
-def open_video(video_path: Path):
-    cap = cv2.VideoCapture(str(video_path))
-    if cap.isOpened():
-        return cap, None
-    tmp = tempfile.NamedTemporaryFile(suffix=video_path.suffix, delete=False)
-    tmp.close()
-    shutil.copy2(str(video_path), tmp.name)
-    return cv2.VideoCapture(tmp.name), tmp.name
-
-
 def count_label_contours(frame, x0, x1, y0, y1) -> int:
     h, w = frame.shape[:2]
     crop = frame[min(y0,h):min(y1,h), min(x0,w):min(x1,w)]
@@ -68,34 +58,39 @@ def count_label_contours(frame, x0, x1, y0, y1) -> int:
     return len(cnts)
 
 
-def white_ratio_in_contours(frame, contours, x0, y0, x1, y1):
-    h, w = frame.shape[:2]
-    region = frame[min(y0,h):min(y1,h), min(x0,w):min(x1,w)]
-    gray   = cv2.cvtColor(region, cv2.COLOR_BGR2GRAY)
-    mask   = np.zeros(gray.shape, dtype=np.uint8)
-    shifted = [(c - np.array([[[x0, y0]]])).astype(np.int32) for c in contours]
-    cv2.drawContours(mask, shifted, -1, 255, thickness=cv2.FILLED)
-    total_pixels = mask.sum() // 255
-    if total_pixels == 0:
-        return False, 0.0
-    white_pixels = ((gray > WHITE_THRESH) & (mask > 0)).sum()
-    ratio = white_pixels / total_pixels
-    return ratio >= WHITE_RATIO_THRESH, ratio
-
-
-def zoom_ratio_excluding_contours(frame, contours, sx0, sy0, sx1, sy1):
-    h, w = frame.shape[:2]
-    crop = frame[min(sy0,h):min(sy1,h), min(sx0,w):min(sx1,w)]
-    if crop.size == 0:
-        return 0.0
-    gray_z    = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-    excl_mask = np.zeros(gray_z.shape, dtype=np.uint8)
+def build_slot_masks(contours, x0, y0, x1, y1):
+    """Precompute the static inside/outside contour masks for the slot box —
+    the contours never change during a video, so drawing them per frame is
+    wasted work. Returns (inside_bool, outside_bool) sized to the slot box."""
+    mask = np.zeros((y1 - y0, x1 - x0), dtype=np.uint8)
     if contours:
-        shifted = [(c - np.array([[[sx0, sy0]]])).astype(np.int32) for c in contours]
-        cv2.drawContours(excl_mask, shifted, -1, 255, thickness=cv2.FILLED)
-    outside = excl_mask == 0
-    total   = outside.sum()
-    return ((gray_z > WHITE_THRESH) & outside).sum() / total if total > 0 else 0.0
+        shifted = [(c - np.array([[[x0, y0]]])).astype(np.int32) for c in contours]
+        cv2.drawContours(mask, shifted, -1, 255, thickness=cv2.FILLED)
+    inside = mask > 0
+    return inside, ~inside
+
+
+def slot_white_and_zoom(frame, masks, x0, y0, x1, y1):
+    """Per-frame check using precomputed masks: one crop + one gray conversion
+    for both the in-contour white ratio and the outside-contour zoom ratio
+    (previously two separate crops/conversions + mask redraws per frame)."""
+    inside, outside = masks
+    h, w = frame.shape[:2]
+    crop = frame[min(y0,h):min(y1,h), min(x0,w):min(x1,w)]
+    if crop.size == 0:
+        return False, 0.0, 0.0
+    gray  = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    white = gray > WHITE_THRESH
+    ins   = inside[:white.shape[0], :white.shape[1]]
+    outs  = outside[:white.shape[0], :white.shape[1]]
+    total_in, total_out = ins.sum(), outs.sum()
+    if total_in == 0:
+        white_state, ratio = False, 0.0
+    else:
+        ratio = (white & ins).sum() / total_in
+        white_state = ratio >= WHITE_RATIO_THRESH
+    zoom = (white & outs).sum() / total_out if total_out > 0 else 0.0
+    return white_state, ratio, zoom
 
 
 def load_contours(path_str):
@@ -106,14 +101,9 @@ def load_contours(path_str):
     return list(data)
 
 
-def fmt_timestamp(seconds: float) -> str:
-    m = int(seconds) // 60
-    s = int(seconds) % 60
-    return f"{m}:{s:02d}"
-
-
 def count_dashes(video_path: Path) -> tuple:
-    """Returns (video_name, total_dashes, timestamp_strings, combos, dash_secs)"""
+    """Returns (video_name, total_dashes, timestamp_strings, combos, dash_secs).
+    combos is a list of (count, label, start_sec, end_sec) tuples."""
     cap, tmp_path = open_video(video_path)
     if not cap.isOpened():
         return video_path.name, 0, [], [], []
@@ -145,6 +135,8 @@ def count_dashes(video_path: Path) -> tuple:
     else:
         sx0, sx1, sy0, sy1 = SLOT2_SEARCH if is_right else SLOT3_SEARCH
 
+    slot_masks = build_slot_masks(slot_contours, sx0, sy0, sx1, sy1)
+
     off_streak   = 0
     was_off      = True
     rearm_at     = 0
@@ -154,6 +146,7 @@ def count_dashes(video_path: Path) -> tuple:
 
     combo_count      = 0
     combo_start_sec  = None
+    combo_last_sec   = None
     combos           = []
 
     read_idx     = 0
@@ -164,9 +157,8 @@ def count_dashes(video_path: Path) -> tuple:
             break
 
         if read_idx % frame_interval == 0:
-            white_state, _ = white_ratio_in_contours(frame, slot_contours, sx0, sy0, sx1, sy1)
-            zoom_ratio     = zoom_ratio_excluding_contours(frame, slot_contours, sx0, sy0, sx1, sy1)
-            zoom_low       = zoom_ratio < ZOOM_LOW_THRESH
+            white_state, _, zoom_ratio = slot_white_and_zoom(frame, slot_masks, sx0, sy0, sx1, sy1)
+            zoom_low = zoom_ratio < ZOOM_LOW_THRESH
 
             if white_state and zoom_low and read_idx >= rearm_at and was_off:
                 total_dashes += 1
@@ -178,15 +170,19 @@ def count_dashes(video_path: Path) -> tuple:
 
                 if combo_start_sec is None:
                     combo_start_sec = t_sec
+                    combo_last_sec  = t_sec
                     combo_count     = 1
                 else:
                     new_count = combo_count + 1
                     if (t_sec - combo_start_sec) <= 0.45 * (new_count - 1) + 0.275:
-                        combo_count = new_count
+                        combo_count    = new_count
+                        combo_last_sec = t_sec
                     else:
                         if combo_count >= 2:
-                            combos.append((combo_count, COMBO_NAMES.get(combo_count, f"{combo_count}x")))
+                            combos.append((combo_count, COMBO_NAMES.get(combo_count, f"{combo_count}x"),
+                                           combo_start_sec, combo_last_sec))
                         combo_start_sec = t_sec
+                        combo_last_sec  = t_sec
                         combo_count     = 1
 
             if not white_state:
@@ -199,7 +195,8 @@ def count_dashes(video_path: Path) -> tuple:
         read_idx += 1
 
     if combo_count >= 2:
-        combos.append((combo_count, COMBO_NAMES.get(combo_count, f"{combo_count}x")))
+        combos.append((combo_count, COMBO_NAMES.get(combo_count, f"{combo_count}x"),
+                       combo_start_sec, combo_last_sec))
 
     cap.release()
     if tmp_path:
@@ -239,12 +236,13 @@ def main():
 
     for name, total, timestamps, combos, dash_secs in all_results:
         times_str  = ", ".join(timestamps) if timestamps else "none"
-        combos_str = ", ".join(f"{lbl} ({n})" for n, lbl in combos) if combos else "none"
+        combos_str = ", ".join(f"{lbl} ({n})" for n, lbl, *_ in combos) if combos else "none"
         print(f"[{name}]")
         print(f"  Dashes : {total}")
         print(f"  Times  : {times_str}")
         print(f"  Combos : {combos_str}\n")
-        results[name] = {"dashes": total, "timestamps": timestamps, "combos": [[n, lbl] for n, lbl in combos]}
+        results[name] = {"dashes": total, "timestamps": timestamps,
+                         "combos": [[n, lbl, s, e] for n, lbl, s, e in combos]}
 
         txt_lines.append(f"=== {name} ===")
         if dash_secs:

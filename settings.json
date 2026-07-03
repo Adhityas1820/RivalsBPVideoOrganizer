@@ -1,0 +1,8 @@
+{
+  "dash_method": "fdnn",
+  "fdnn_threshold": 0.75,
+  "output_mode": "clip",
+  "dash_clip_min": 2,
+  "kill_clip_min": 2,
+  "clip_pad_secs": 2.0
+}

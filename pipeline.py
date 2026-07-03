@@ -24,16 +24,17 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-import torch
-import torch.nn.functional as F
-from PIL import Image
-from torchvision import models, transforms
 
-from game_mode_select import is_domination
+# torch / torchvision / PIL are imported lazily inside the functions that use
+# them — importing them here would add several seconds to app launch before
+# the window can even appear.
+
+from video_io import open_video
 from dash_counter import count_dashes
 from kill_counter import (count_kills, load_contours as load_kill_contours,
                           SLOT1_CONTOUR_PATH as BOARD_SLOT1_CONTOUR_PATH,
                           SLOT2_CONTOUR_PATH as BOARD_SLOT2_CONTOUR_PATH)
+from clip_export import trim_clip
 
 # ---------------------------------------------------------------------------
 # Config
@@ -49,13 +50,17 @@ DASH_METHOD     = "contour"
 FDNN_THRESHOLD  = 0.7   # NMS confidence cutoff for the FDNN detector
 FDNN_MODEL_PATH = "models/sdsnn.pt"
 
-USE_DOMINATION_FILTER  = False   # set False to skip game-mode pre-filtering and allow all maps
+# Output mode: 'rename' (default, copy the whole clip like today) or 'clip'
+# (trim out just the qualifying dash-combo/kill-streak moments). Overridden
+# per-run by options['output_mode'] / ['dash_clip_min'] / ['kill_clip_min'] /
+# ['clip_pad_secs'].
+OUTPUT_MODE    = "rename"
+DASH_CLIP_MIN  = 2     # minimum combo tier to clip: 2=Double .. 5=Penta
+KILL_CLIP_MIN  = 1     # minimum kills in a streak to clip
+CLIP_PAD_SECS  = 2.0   # buffer seconds added before/after each moment
+
 FRAME_INTERVAL_SECONDS = 0.5
 IMG_SIZE = 224
-DOMINATION_MAPS = {
-    "Birnin TChalla", "Celestial Husk", "Hells Heaven",
-    "Krakoa", "Lower Manhattan", "Royal Palace",
-}
 BLACKOUT_BOXES = [
     (25,   600,  900, 1060),
     (1450, 1875, 900, 1065),
@@ -64,11 +69,20 @@ BLACKOUT_BOXES = [
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD  = [0.229, 0.224, 0.225]
 
-_transform = transforms.Compose([
-    transforms.Resize((IMG_SIZE, IMG_SIZE)),
-    transforms.ToTensor(),
-    transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
-])
+_transform = None
+
+
+def _get_transform():
+    """Build (and cache) the torchvision preprocessing pipeline on first use."""
+    global _transform
+    if _transform is None:
+        from torchvision import transforms
+        _transform = transforms.Compose([
+            transforms.Resize((IMG_SIZE, IMG_SIZE)),
+            transforms.ToTensor(),
+            transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
+        ])
+    return _transform
 
 # Stage metadata shared with the UI.
 STAGE_META = [
@@ -95,18 +109,9 @@ def apply_blackout(frame):
     return frame
 
 
-def open_video(video_path: Path):
-    cap = cv2.VideoCapture(str(video_path))
-    if cap.isOpened():
-        return cap, None
-    import tempfile as _tmp
-    t = _tmp.NamedTemporaryFile(suffix=video_path.suffix, delete=False)
-    t.close()
-    shutil.copy2(str(video_path), t.name)
-    return cv2.VideoCapture(t.name), t.name
-
-
 def load_map_classifier(model_path: str, device):
+    import torch
+    from torchvision import models
     ckpt    = torch.load(model_path, map_location=device)
     classes = ckpt["classes"]
     model   = models.resnet18(weights=None)
@@ -117,20 +122,26 @@ def load_map_classifier(model_path: str, device):
 
 
 def extract_pil_frames(video_path: Path) -> list:
+    from PIL import Image
     cap, tmp_path = open_video(video_path)
     if not cap.isOpened():
         return []
     fps  = cap.get(cv2.CAP_PROP_FPS) or 30
     step = max(1, int(fps * FRAME_INTERVAL_SECONDS))
+    # Sequential grab() + retrieve() of every step-th frame: same frames as
+    # seeking to each sample, but without re-decoding from the previous
+    # keyframe for every seek (which made this several times slower).
     idx, frames = 0, []
     while True:
-        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
-        ret, frame = cap.read()
-        if not ret:
+        if not cap.grab():
             break
-        apply_blackout(frame)
-        frames.append(Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)))
-        idx += step
+        if idx % step == 0:
+            ret, frame = cap.retrieve()
+            if not ret:
+                break
+            apply_blackout(frame)
+            frames.append(Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)))
+        idx += 1
     cap.release()
     if tmp_path:
         Path(tmp_path).unlink(missing_ok=True)
@@ -195,6 +206,49 @@ def _merge_dash_results(method, contour_results, fdnn_results):
     return merged
 
 
+def _unique_dest(stem: str, suffix: str) -> Path:
+    dest = Path(SORTED_DIR) / f'{stem}{suffix}'
+    c2 = 1
+    while dest.exists():
+        dest = Path(SORTED_DIR) / f'{stem} ({c2}){suffix}'
+        c2 += 1
+    return dest
+
+
+def dash_qualifying_moments(combos, min_tier: int, pad: float) -> list:
+    """combos: [(count, label, start_sec, end_sec), ...]. Returns
+    [(clip_start, clip_end, label), ...] for combos at or above min_tier."""
+    return [(max(0.0, start - pad), end + pad, label)
+            for count, label, start, end in combos if count >= min_tier]
+
+
+def kill_qualifying_moments(streaks, min_kills: int, pad: float) -> list:
+    """streaks: [(count, start_sec, end_sec), ...]. Returns
+    [(clip_start, clip_end, label), ...] for streaks at or above min_kills."""
+    return [(max(0.0, start - pad), end + pad, f'{count}k Streak')
+            for count, start, end in streaks if count >= min_kills]
+
+
+def merge_moments(moments: list) -> list:
+    """Merge overlapping/touching (start, end, label) moments into single spans
+    so the same footage is never exported as more than one clip (a dash combo
+    and a kill streak can land in the same window). Combined labels join with
+    ' + '. Returns moments sorted by start time."""
+    if not moments:
+        return []
+    ordered = sorted(moments, key=lambda m: m[0])
+    merged = [list(ordered[0])]
+    for start, end, label in ordered[1:]:
+        last = merged[-1]
+        if start <= last[1]:
+            last[1] = max(last[1], end)
+            if label not in last[2].split(' + '):
+                last[2] = f'{last[2]} + {label}'
+        else:
+            merged.append([start, end, label])
+    return [tuple(m) for m in merged]
+
+
 # ---------------------------------------------------------------------------
 # Export helpers (used by the UI's save / zip actions)
 # ---------------------------------------------------------------------------
@@ -235,6 +289,13 @@ def run_pipeline(videos, options, emit):
         run_kills  = options.get('kills', True)
         run_dashes = options.get('dashes', True)
         run_combos = options.get('combos', True)
+
+        output_mode   = (options.get('output_mode') or OUTPUT_MODE).lower()
+        dash_clip_min = int(options.get('dash_clip_min', DASH_CLIP_MIN))
+        kill_clip_min = int(options.get('kill_clip_min', KILL_CLIP_MIN))
+        clip_pad_secs = float(options.get('clip_pad_secs', CLIP_PAD_SECS))
+        if output_mode not in ('rename', 'clip'):
+            output_mode = 'rename'
 
         if not videos:
             emit('error', message='No videos selected.')
@@ -292,14 +353,14 @@ def run_pipeline(videos, options, emit):
             fdnn_results = _fdnn_dashes(videos, fdnn_thr, emit) if use_fdnn else []
 
             if run_kills:
-                kills_map = {nm: tot for nm, tot, _ in kill_results}
-                for nm, tot, _ in kill_results:
+                kills_map = {nm: (tot, streaks) for nm, tot, _, streaks, __ in kill_results}
+                for nm, tot, _, streaks, __ in kill_results:
                     emit('log', message=f'  [{nm}]  kills {tot}')
             if need_dashes:
                 dash_results = _merge_dash_results(method, contour_results, fdnn_results)
                 dashes_map = {nm: (tot, cb) for nm, tot, _, cb, __ in dash_results}
                 for nm, tot, _, cb, __ in dash_results:
-                    cs = ('  (' + ' - '.join(lbl for _, lbl in cb) + ')') if cb else ''
+                    cs = ('  (' + ' - '.join(lbl for _, lbl, *_ in cb) + ')') if cb else ''
                     emit('log', message=f'  [{nm}]  dashes {tot}{cs}')
 
             emit('stage', stage='kills_dashes', status='done')
@@ -308,27 +369,27 @@ def run_pipeline(videos, options, emit):
 
         map_by_name = {}
         if run_map:
+            import torch
+            import torch.nn.functional as F
             emit('stage', stage='frames', status='active')
             device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
             emit('log', message=f'Device: {device}')
             classifier, classes = load_map_classifier(MAP_MODEL_PATH, device)
 
             with ThreadPoolExecutor(max_workers=nw) as ex:
-                video_data = list(ex.map(
-                    lambda vp: (extract_pil_frames(vp),
-                               is_domination(vp)[0] if USE_DOMINATION_FILTER else False),
-                    videos))
+                video_data = list(ex.map(extract_pil_frames, videos))
 
             emit('progress', value=65)
             emit('stage', stage='frames', status='done')
 
             emit('stage', stage='classify', status='active')
+            transform = _get_transform()
             all_tensors, frame_counts, valid_idx = [], [], []
-            for i, (pil_frames, _) in enumerate(video_data):
+            for i, pil_frames in enumerate(video_data):
                 if not pil_frames:
                     frame_counts.append(0)
                     continue
-                ts = [_transform(pf) for pf in pil_frames]
+                ts = [transform(pf) for pf in pil_frames]
                 all_tensors.extend(ts)
                 frame_counts.append(len(ts))
                 valid_idx.append(i)
@@ -356,12 +417,6 @@ def run_pipeline(videos, options, emit):
                     cnt  = frame_counts[i]
                     avg  = np.mean(all_probs[ptr:ptr + cnt], axis=0)
                     ptr += cnt
-                    _, dom = video_data[i]
-                    allowed = (set(classes) if not USE_DOMINATION_FILTER
-                               else DOMINATION_MAPS if dom
-                               else {c for c in classes if c not in DOMINATION_MAPS})
-                    mask = np.array([c in allowed for c in classes], dtype=float)
-                    avg  = avg * mask
                     best = int(np.argmax(avg))
                     map_by_name[videos[i].name] = (classes[best], float(avg[best]))
 
@@ -381,27 +436,49 @@ def run_pipeline(videos, options, emit):
                     emit('log', message=f'  SKIP {nm}')
                     continue
                 map_name, conf = map_by_name[nm]
-            kills          = kills_map.get(nm, 0)
+            kills, streaks = kills_map.get(nm, (0, []))
             dashes, combos = dashes_map.get(nm, (0, []))
-            combo_str      = (' - '.join(lbl for _, lbl in combos)) if combos else None
+            combo_str      = (' - '.join(lbl for _, lbl, *_ in combos)) if combos else None
 
-            parts = []
-            if run_map:               parts.append(map_name)
-            if run_dashes:            parts.append(f'{dashes}d')
-            if run_combos and combo_str: parts.append(combo_str)
-            if run_kills:             parts.append(f'{kills}k')
-            stem = ' - '.join(parts) if parts else vp.stem
+            if output_mode == 'clip':
+                moments = (dash_qualifying_moments(combos, dash_clip_min, clip_pad_secs) +
+                          kill_qualifying_moments(streaks, kill_clip_min, clip_pad_secs))
+                if not moments:
+                    emit('log', message=f'  SKIP {nm} (no qualifying moments)')
+                    continue
+                moments = merge_moments(moments)
+                for start, end, label in moments:
+                    parts = []
+                    if run_map: parts.append(map_name)
+                    parts.append(label)
+                    if run_dashes: parts.append(f'{dashes}d')
+                    if run_kills:  parts.append(f'{kills}k')
+                    stem = ' - '.join(parts)
 
-            dest = Path(SORTED_DIR) / f'{stem}{vp.suffix}'
-            c2 = 1
-            while dest.exists():
-                dest = Path(SORTED_DIR) / f'{stem} ({c2}){vp.suffix}'
-                c2 += 1
-            shutil.copy2(str(vp), str(dest))
-            results.append({'original': nm, 'filename': dest.name,
-                            'map': map_name, 'conf': round(conf * 100),
-                            'kills': kills, 'dashes': dashes, 'combos': combo_str})
-            emit('log', message=f'  {dest.name}', tag='ok')
+                    dest = _unique_dest(stem, vp.suffix)
+                    if not trim_clip(vp, start, end, dest):
+                        emit('log', message=f'  FAILED to clip {nm} @ {label}', tag='warn')
+                        continue
+                    results.append({'original': nm, 'filename': dest.name,
+                                    'map': map_name, 'conf': round(conf * 100),
+                                    'kills': kills, 'dashes': dashes, 'combos': combo_str,
+                                    'clip_label': label})
+                    emit('log', message=f'  {dest.name}', tag='ok')
+            else:
+                parts = []
+                if run_map:               parts.append(map_name)
+                if run_dashes:            parts.append(f'{dashes}d')
+                if run_combos and combo_str: parts.append(combo_str)
+                if run_kills:             parts.append(f'{kills}k')
+                stem = ' - '.join(parts) if parts else vp.stem
+
+                dest = _unique_dest(stem, vp.suffix)
+                shutil.copy2(str(vp), str(dest))
+                results.append({'original': nm, 'filename': dest.name,
+                                'map': map_name, 'conf': round(conf * 100),
+                                'kills': kills, 'dashes': dashes, 'combos': combo_str})
+                emit('log', message=f'  {dest.name}', tag='ok')
+
             emit('progress', value=80 + int(20 * (idx + 1) / n))
 
         emit('stage', stage='organize', status='done')
